@@ -4,11 +4,14 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 
 namespace {
@@ -27,6 +30,18 @@ namespace {
         std::uint64_t layer_count;
         std::uint64_t head_count;
         std::uint64_t channel_count;
+    };
+
+    struct ParameterTensor {
+        std::string_view name;
+        std::vector<std::uint64_t> shape;
+        std::uint64_t element_count;
+        std::uint64_t byte_offset;
+    };
+
+    struct CommandLineOptions {
+        std::filesystem::path checkpoint_path;
+        bool list_tensors;
     };
 
     std::uint64_t checked_add(
@@ -110,34 +125,63 @@ namespace {
         return config;
     }
 
-    std::uint64_t parameter_count(const Gpt2Config& config) {
+    std::vector<ParameterTensor> make_parameter_layout(
+        const Gpt2Config& config
+    ) {
         const std::uint64_t max_t = config.max_sequence_length;
         const std::uint64_t vocabulary = config.padded_vocabulary_size;
         const std::uint64_t layers = config.layer_count;
         const std::uint64_t channels = config.channel_count;
 
-        const std::array<std::uint64_t, 16> tensor_sizes{
-            checked_multiply({ vocabulary, channels }),
-            checked_multiply({ max_t, channels }),
-            checked_multiply({ layers, channels }),
-            checked_multiply({ layers, channels }),
-            checked_multiply({ layers, 3, channels, channels }),
-            checked_multiply({ layers, 3, channels }),
-            checked_multiply({ layers, channels, channels }),
-            checked_multiply({ layers, channels }),
-            checked_multiply({ layers, channels }),
-            checked_multiply({ layers, channels }),
-            checked_multiply({ layers, 4, channels, channels }),
-            checked_multiply({ layers, 4, channels }),
-            checked_multiply({ layers, channels, 4, channels }),
-            checked_multiply({ layers, channels }),
-            channels,
-            channels,
+        struct TensorDefinition {
+            std::string_view name;
+            std::initializer_list<std::uint64_t> shape;
         };
 
+        const std::array<TensorDefinition, 16> definitions{
+            TensorDefinition{ "wte", { vocabulary, channels } },
+            TensorDefinition{ "wpe", { max_t, channels } },
+            TensorDefinition{ "ln1w", { layers, channels } },
+            TensorDefinition{ "ln1b", { layers, channels } },
+            TensorDefinition{ "qkvw", { layers, 3 * channels, channels } },
+            TensorDefinition{ "qkvb", { layers, 3 * channels } },
+            TensorDefinition{ "attprojw", { layers, channels, channels } },
+            TensorDefinition{ "attprojb", { layers, channels } },
+            TensorDefinition{ "ln2w", { layers, channels } },
+            TensorDefinition{ "ln2b", { layers, channels } },
+            TensorDefinition{ "fcw", { layers, 4 * channels, channels } },
+            TensorDefinition{ "fcb", { layers, 4 * channels } },
+            TensorDefinition{ "fcprojw", { layers, channels, 4 * channels } },
+            TensorDefinition{ "fcprojb", { layers, channels } },
+            TensorDefinition{ "lnfw", { channels } },
+            TensorDefinition{ "lnfb", { channels } },
+        };
+
+        std::vector<ParameterTensor> layout;
+        layout.reserve(definitions.size());
+
+        std::uint64_t byte_offset = kHeaderBytes;
+        for (const TensorDefinition& definition : definitions) {
+            const std::uint64_t elements = checked_multiply(definition.shape);
+            layout.push_back(ParameterTensor{
+                .name = definition.name,
+                .shape = definition.shape,
+                .element_count = elements,
+                .byte_offset = byte_offset,
+            });
+            byte_offset = checked_add(
+                byte_offset, checked_multiply({ elements, kParameterBytes })
+            );
+        }
+        return layout;
+    }
+
+    std::uint64_t parameter_count(
+        const std::vector<ParameterTensor>& layout
+    ) {
         std::uint64_t total = 0;
-        for (const std::uint64_t size : tensor_sizes) {
-            total = checked_add(total, size);
+        for (const ParameterTensor& tensor : layout) {
+            total = checked_add(total, tensor.element_count);
         }
         return total;
     }
@@ -173,10 +217,41 @@ namespace {
         return header;
     }
 
-    void inspect_checkpoint(const std::filesystem::path& checkpoint_path) {
+    void print_parameter_layout(
+        const std::vector<ParameterTensor>& layout
+    ) {
+        std::cout << "\n[Parameter tensors]\n"
+                  << std::left << std::setw(12) << "name"
+                  << std::setw(22) << "shape"
+                  << std::right << std::setw(14) << "elements"
+                  << std::setw(16) << "byte_offset" << '\n';
+
+        for (const ParameterTensor& tensor : layout) {
+            std::string shape;
+            for (const std::uint64_t dimension : tensor.shape) {
+                if (!shape.empty()) {
+                    shape += " x ";
+                }
+                shape += std::to_string(dimension);
+            }
+
+            std::cout << std::left << std::setw(12) << tensor.name
+                      << std::setw(22) << shape
+                      << std::right << std::setw(14) << tensor.element_count
+                      << std::setw(16) << tensor.byte_offset << '\n';
+        }
+    }
+
+    void inspect_checkpoint(
+        const std::filesystem::path& checkpoint_path,
+        const bool list_tensors
+    ) {
         const auto header = read_header(checkpoint_path);
         const Gpt2Config config = parse_config(header);
-        const std::uint64_t parameters = parameter_count(config);
+        const std::vector<ParameterTensor> layout = make_parameter_layout(
+            config
+        );
+        const std::uint64_t parameters = parameter_count(layout);
         const std::uint64_t expected_file_bytes = checked_add(
             kHeaderBytes, checked_multiply({ parameters, kParameterBytes })
         );
@@ -203,18 +278,74 @@ namespace {
                   << "channels: " << config.channel_count << '\n'
                   << "num_parameters: " << parameters << '\n'
                   << "checkpoint_bytes: " << actual_file_bytes << '\n';
+
+        if (list_tensors) {
+            print_parameter_layout(layout);
+        }
+    }
+
+    void print_usage(const char* executable_name) {
+        std::cout
+            << "Usage: " << executable_name
+            << " [--list-tensors] <checkpoint_path>\n\n"
+            << "Print and validate an llm.c GPT-2 v3 checkpoint.\n\n"
+            << "Options:\n"
+            << "  --list-tensors  Print parameter shapes and byte offsets.\n"
+            << "  --help          Show this help message.\n";
+    }
+
+    std::optional<CommandLineOptions> parse_arguments(
+        const int argc, char* argv[]
+    ) {
+        bool list_tensors = false;
+        std::optional<std::filesystem::path> checkpoint_path;
+
+        for (int index = 1; index < argc; ++index) {
+            const std::string_view argument{ argv[index] };
+            if (argument == "--help") {
+                print_usage(argv[0]);
+                return std::nullopt;
+            }
+            if (argument == "--list-tensors") {
+                list_tensors = true;
+                continue;
+            }
+            if (argument.starts_with('-')) {
+                throw std::runtime_error(
+                    "unknown option: " + std::string{ argument }
+                );
+            }
+            if (checkpoint_path.has_value()) {
+                throw std::runtime_error("multiple checkpoint paths provided");
+            }
+            checkpoint_path = argument;
+        }
+
+        if (!checkpoint_path.has_value()) {
+            throw std::runtime_error("checkpoint path is required");
+        }
+
+        return CommandLineOptions{
+            .checkpoint_path = *checkpoint_path,
+            .list_tensors = list_tensors,
+        };
     }
 
 }  // namespace
 
 
 int main(const int argc, char* argv[]) {
-    const std::filesystem::path checkpoint_path{ argv[1] };
-
     try {
-        inspect_checkpoint(checkpoint_path);
+        const std::optional<CommandLineOptions> options = parse_arguments(
+            argc, argv
+        );
+        if (!options.has_value()) {
+            return 0;
+        }
+        inspect_checkpoint(options->checkpoint_path, options->list_tensors);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
+        print_usage(argv[0]);
         return 1;
     }
     return 0;

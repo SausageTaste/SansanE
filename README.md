@@ -49,10 +49,10 @@ cmake -S . -B build
 cmake --build build
 ```
 
-Run it with the default sibling-directory checkpoint path:
+Run it with the sibling-directory checkpoint path:
 
 ```bash
-./build/checkpoint_inspector
+./build/checkpoint_inspector ../llm.c-reference/gpt2_124M.bin
 ```
 
 Alternatively, provide an explicit checkpoint path:
@@ -62,3 +62,11 @@ Alternatively, provide an explicit checkpoint path:
 ```
 
 The inspector validates the checkpoint magic number, format version, model dimensions, attention-head divisibility, calculated parameter count, and exact file size before printing the GPT-2 configuration.
+
+To inspect the 16 parameter tensors in checkpoint order, including their shapes and byte offsets:
+
+```bash
+./build/checkpoint_inspector \
+  --list-tensors \
+  ../llm.c-reference/gpt2_124M.bin
+```

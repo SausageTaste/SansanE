@@ -28,4 +28,10 @@ if(BUILD_TESTING)
     add_test(NAME checkpoint_inspector_help
         COMMAND checkpoint_inspector --help
     )
+    add_test(NAME checkpoint_inspector_requires_path
+        COMMAND checkpoint_inspector
+    )
+    set_tests_properties(checkpoint_inspector_requires_path PROPERTIES
+        WILL_FAIL TRUE
+    )
 endif()
