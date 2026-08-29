@@ -67,6 +67,6 @@ To inspect the 16 parameter tensors in checkpoint order, including their shapes 
 
 ```bash
 ./build/checkpoint_inspector \
-  --list-tensors \
-  ../llm.c-reference/gpt2_124M.bin
+  ../llm.c-reference/gpt2_124M.bin \
+  --list-tensors
 ```

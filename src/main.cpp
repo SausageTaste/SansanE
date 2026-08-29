@@ -7,7 +7,6 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -37,11 +36,6 @@ namespace {
         std::vector<std::uint64_t> shape;
         std::uint64_t element_count;
         std::uint64_t byte_offset;
-    };
-
-    struct CommandLineOptions {
-        std::filesystem::path checkpoint_path;
-        bool list_tensors;
     };
 
     std::uint64_t checked_add(
@@ -284,68 +278,26 @@ namespace {
         }
     }
 
-    void print_usage(const char* executable_name) {
-        std::cout
-            << "Usage: " << executable_name
-            << " [--list-tensors] <checkpoint_path>\n\n"
-            << "Print and validate an llm.c GPT-2 v3 checkpoint.\n\n"
-            << "Options:\n"
-            << "  --list-tensors  Print parameter shapes and byte offsets.\n"
-            << "  --help          Show this help message.\n";
-    }
-
-    std::optional<CommandLineOptions> parse_arguments(
-        const int argc, char* argv[]
-    ) {
-        bool list_tensors = false;
-        std::optional<std::filesystem::path> checkpoint_path;
-
-        for (int index = 1; index < argc; ++index) {
-            const std::string_view argument{ argv[index] };
-            if (argument == "--help") {
-                print_usage(argv[0]);
-                return std::nullopt;
-            }
-            if (argument == "--list-tensors") {
-                list_tensors = true;
-                continue;
-            }
-            if (argument.starts_with('-')) {
-                throw std::runtime_error(
-                    "unknown option: " + std::string{ argument }
-                );
-            }
-            if (checkpoint_path.has_value()) {
-                throw std::runtime_error("multiple checkpoint paths provided");
-            }
-            checkpoint_path = argument;
-        }
-
-        if (!checkpoint_path.has_value()) {
-            throw std::runtime_error("checkpoint path is required");
-        }
-
-        return CommandLineOptions{
-            .checkpoint_path = *checkpoint_path,
-            .list_tensors = list_tensors,
-        };
-    }
-
 }  // namespace
 
 
 int main(const int argc, char* argv[]) {
+    if (argc < 2 || argc > 3) {
+        std::cerr << "usage: " << argv[0]
+                  << " <checkpoint_path> [--list-tensors]\n";
+        return 1;
+    }
+
+    const bool list_tensors = argc == 3;
+    if (list_tensors && std::string_view{ argv[2] } != "--list-tensors") {
+        std::cerr << "error: unknown option: " << argv[2] << '\n';
+        return 1;
+    }
+
     try {
-        const std::optional<CommandLineOptions> options = parse_arguments(
-            argc, argv
-        );
-        if (!options.has_value()) {
-            return 0;
-        }
-        inspect_checkpoint(options->checkpoint_path, options->list_tensors);
+        inspect_checkpoint(argv[1], list_tensors);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
-        print_usage(argv[0]);
         return 1;
     }
     return 0;
