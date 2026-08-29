@@ -39,3 +39,26 @@ ls -lh \
 ```
 
 The download workflow and binary artifacts come from [Karpathy's `llm.c`](https://github.com/karpathy/llm.c).
+
+## Build and Inspect the Checkpoint
+
+Configure and build the C++ checkpoint inspector from the SansanE repository root:
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+Run it with the default sibling-directory checkpoint path:
+
+```bash
+./build/checkpoint_inspector
+```
+
+Alternatively, provide an explicit checkpoint path:
+
+```bash
+./build/checkpoint_inspector /path/to/gpt2_124M.bin
+```
+
+The inspector validates the checkpoint magic number, format version, model dimensions, attention-head divisibility, calculated parameter count, and exact file size before printing the GPT-2 configuration.
