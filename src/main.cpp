@@ -173,15 +173,6 @@ namespace {
         return header;
     }
 
-    void print_usage(const char* executable_name) {
-        std::cout
-            << "Usage: " << executable_name << " [checkpoint_path]\n"
-            << "\n"
-            << "Print and validate the configuration stored in an llm.c GPT-2 "
-               "v3 checkpoint.\n"
-            << "Default checkpoint: ../llm.c-reference/gpt2_124M.bin\n";
-    }
-
     void inspect_checkpoint(const std::filesystem::path& checkpoint_path) {
         const auto header = read_header(checkpoint_path);
         const Gpt2Config config = parse_config(header);
@@ -218,18 +209,7 @@ namespace {
 
 
 int main(const int argc, char* argv[]) {
-    if (argc == 2 && std::string_view{ argv[1] } == "--help") {
-        print_usage(argv[0]);
-        return 0;
-    }
-    if (argc > 2) {
-        print_usage(argv[0]);
-        return 2;
-    }
-
-    const std::filesystem::path checkpoint_path =
-        argc == 2 ? std::filesystem::path{ argv[1] }
-                  : std::filesystem::path{ "../llm.c-reference/gpt2_124M.bin" };
+    const std::filesystem::path checkpoint_path{ argv[1] };
 
     try {
         inspect_checkpoint(checkpoint_path);
