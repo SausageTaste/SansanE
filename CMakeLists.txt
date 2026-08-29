@@ -12,13 +12,7 @@ set_target_properties(checkpoint_inspector PROPERTIES
 )
 
 if(MSVC)
-    target_compile_options(checkpoint_inspector PRIVATE /W4 /permissive-)
+    target_compile_options(checkpoint_inspector PRIVATE /W4)
 else()
-    target_compile_options(checkpoint_inspector PRIVATE
-        -Wall
-        -Wextra
-        -Wpedantic
-        -Wconversion
-        -Wsign-conversion
-    )
+    target_compile_options(checkpoint_inspector PRIVATE -Wall -Wextra)
 endif()
