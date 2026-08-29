@@ -6,7 +6,7 @@ add_executable(checkpoint_inspector
     src/main.cpp
 )
 
-target_compile_features(checkpoint_inspector PRIVATE cxx_std_20)
+target_compile_features(checkpoint_inspector PRIVATE cxx_std_23)
 set_target_properties(checkpoint_inspector PROPERTIES
     CXX_EXTENSIONS OFF
 )
