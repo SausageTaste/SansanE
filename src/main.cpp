@@ -157,12 +157,14 @@ namespace {
         std::uint64_t byte_offset = kHeaderBytes;
         for (const TensorDefinition& definition : definitions) {
             const std::uint64_t elements = checked_multiply(definition.shape);
-            layout.push_back(ParameterTensor{
-                .name = definition.name,
-                .shape = definition.shape,
-                .element_count = elements,
-                .byte_offset = byte_offset,
-            });
+            layout.push_back(
+                ParameterTensor{
+                    .name = definition.name,
+                    .shape = definition.shape,
+                    .element_count = elements,
+                    .byte_offset = byte_offset,
+                }
+            );
             byte_offset = checked_add(
                 byte_offset, checked_multiply({ elements, kParameterBytes })
             );
@@ -170,9 +172,7 @@ namespace {
         return layout;
     }
 
-    std::uint64_t parameter_count(
-        const std::vector<ParameterTensor>& layout
-    ) {
+    std::uint64_t parameter_count(const std::vector<ParameterTensor>& layout) {
         std::uint64_t total = 0;
         for (const ParameterTensor& tensor : layout) {
             total = checked_add(total, tensor.element_count);
@@ -211,13 +211,10 @@ namespace {
         return header;
     }
 
-    void print_parameter_layout(
-        const std::vector<ParameterTensor>& layout
-    ) {
+    void print_parameter_layout(const std::vector<ParameterTensor>& layout) {
         std::cout << "\n[Parameter tensors]\n"
-                  << std::left << std::setw(12) << "name"
-                  << std::setw(22) << "shape"
-                  << std::right << std::setw(14) << "elements"
+                  << std::left << std::setw(12) << "name" << std::setw(22)
+                  << "shape" << std::right << std::setw(14) << "elements"
                   << std::setw(16) << "byte_offset" << '\n';
 
         for (const ParameterTensor& tensor : layout) {
@@ -230,15 +227,14 @@ namespace {
             }
 
             std::cout << std::left << std::setw(12) << tensor.name
-                      << std::setw(22) << shape
-                      << std::right << std::setw(14) << tensor.element_count
-                      << std::setw(16) << tensor.byte_offset << '\n';
+                      << std::setw(22) << shape << std::right << std::setw(14)
+                      << tensor.element_count << std::setw(16)
+                      << tensor.byte_offset << '\n';
         }
     }
 
     void inspect_checkpoint(
-        const std::filesystem::path& checkpoint_path,
-        const bool list_tensors
+        const std::filesystem::path& checkpoint_path, const bool list_tensors
     ) {
         const auto header = read_header(checkpoint_path);
         const Gpt2Config config = parse_config(header);
