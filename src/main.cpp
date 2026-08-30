@@ -613,6 +613,65 @@ namespace {
         return score / scale;
     }
 
+    std::vector<float> softmax(const std::vector<float>& scores) {
+        if (scores.empty()) {
+            throw std::invalid_argument("cannot apply softmax to no scores");
+        }
+
+        float maximum = scores.front();
+        for (const float score : scores) {
+            if (!std::isfinite(score)) {
+                throw std::invalid_argument("softmax scores must be finite");
+            }
+            if (score > maximum) {
+                maximum = score;
+            }
+        }
+
+        std::vector<float> probabilities(scores.size());
+        float exponential_sum = 0.0F;
+        for (size_t index = 0; index < scores.size(); ++index) {
+            probabilities[index] = std::exp(scores[index] - maximum);
+            exponential_sum += probabilities[index];
+        }
+        for (float& probability : probabilities) {
+            probability /= exponential_sum;
+        }
+        return probabilities;
+    }
+
+    std::vector<float> weighted_value_sum(
+        const std::vector<float>& probabilities,
+        const std::vector<float>& values,
+        const size_t channels_per_value
+    ) {
+        if (probabilities.empty() || channels_per_value == 0) {
+            throw std::invalid_argument(
+                "attention probabilities and values must not be empty"
+            );
+        }
+        const uint64_t expected_value_elements = checked_multiply(
+            { static_cast<uint64_t>(probabilities.size()),
+              static_cast<uint64_t>(channels_per_value) }
+        );
+        if (values.size() != expected_value_elements) {
+            throw std::invalid_argument(
+                "attention value dimensions do not match probabilities"
+            );
+        }
+
+        std::vector<float> output(channels_per_value, 0.0F);
+        for (size_t value_index = 0; value_index < probabilities.size();
+             ++value_index) {
+            const size_t value_offset = value_index * channels_per_value;
+            for (size_t channel = 0; channel < channels_per_value; ++channel) {
+                output[channel] += probabilities[value_index] *
+                                   values[value_offset + channel];
+            }
+        }
+        return output;
+    }
+
     void print_vector_preview(
         const std::string_view title, const std::vector<float>& values
     ) {
@@ -740,14 +799,24 @@ namespace {
 
         // 9. Measure how strongly this token's query matches its own key. The
         // square-root scaling keeps scores from growing with the head width.
-        const float attention_score = scaled_attention_score(
-            query_head, key_head
+        const std::vector<float> attention_scores{
+            scaled_attention_score(query_head, key_head)
+        };
+        std::cout << "\nquery_position: " << kInspectedPosition << '\n'
+                  << "key_position: " << kInspectedPosition << '\n';
+        print_vector_preview("Scaled attention scores", attention_scores);
+
+        // 10. Convert all causally allowed scores into probabilities, then
+        // blend their value vectors with those probabilities. Position 0 has
+        // only itself available, so softmax([-0.788...]) is exactly [1].
+        const auto attention_probabilities = softmax(attention_scores);
+        const auto attention_output = weighted_value_sum(
+            attention_probabilities, value_head, value_head.size()
         );
-        std::cout << "\n[Scaled attention score]\n"
-                  << "query_position: " << kInspectedPosition << '\n'
-                  << "key_position: " << kInspectedPosition << '\n'
-                  << "all_finite: " << std::isfinite(attention_score) << '\n'
-                  << "value: " << attention_score << '\n';
+        print_vector_preview(
+            "Attention probabilities", attention_probabilities
+        );
+        print_vector_preview("Attention head output", attention_output);
     }
 
 }  // namespace
