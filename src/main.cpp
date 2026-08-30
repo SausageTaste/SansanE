@@ -25,6 +25,12 @@ namespace {
         uint64_t byte_offset;
     };
 
+    struct QkvVectors {
+        std::vector<float> query;
+        std::vector<float> key;
+        std::vector<float> value;
+    };
+
     uint64_t checked_add(const uint64_t left, const uint64_t right) {
         if (right > std::numeric_limits<uint64_t>::max() - left) {
             throw std::overflow_error(
@@ -95,6 +101,14 @@ namespace {
                     { this->parameter_count(), Gpt2Config::kParameterBytes }
                 )
             );
+        }
+
+        size_t channel_count() const {
+            return static_cast<size_t>(channel_count_);
+        }
+
+        size_t head_count() const {
+            return static_cast<size_t>(head_count_);
         }
 
         std::vector<float> read_token_embedding(
@@ -527,6 +541,54 @@ namespace {
         return output;
     }
 
+    QkvVectors split_qkv(
+        const std::vector<float>& combined, const size_t channel_count
+    ) {
+        const uint64_t expected_elements = checked_multiply(
+            { 3, static_cast<uint64_t>(channel_count) }
+        );
+        if (combined.size() != expected_elements) {
+            throw std::invalid_argument(
+                "combined QKV dimensions do not match the channel count"
+            );
+        }
+
+        QkvVectors output{
+            .query = std::vector<float>(channel_count),
+            .key = std::vector<float>(channel_count),
+            .value = std::vector<float>(channel_count),
+        };
+        for (size_t channel = 0; channel < channel_count; ++channel) {
+            output.query[channel] = combined[channel];
+            output.key[channel] = combined[channel_count + channel];
+            output.value[channel] = combined[2 * channel_count + channel];
+        }
+        return output;
+    }
+
+    std::vector<float> extract_attention_head(
+        const std::vector<float>& channels,
+        const size_t head_index,
+        const size_t head_count
+    ) {
+        if (head_count == 0 || channels.size() % head_count != 0) {
+            throw std::invalid_argument(
+                "channels cannot be divided evenly into attention heads"
+            );
+        }
+        if (head_index >= head_count) {
+            throw std::out_of_range("attention head index is outside the model");
+        }
+
+        const size_t channels_per_head = channels.size() / head_count;
+        const size_t head_offset = head_index * channels_per_head;
+        std::vector<float> output(channels_per_head);
+        for (size_t channel = 0; channel < channels_per_head; ++channel) {
+            output[channel] = channels[head_offset + channel];
+        }
+        return output;
+    }
+
     void print_vector_preview(
         const std::string_view title, const std::vector<float>& values
     ) {
@@ -603,10 +665,23 @@ namespace {
         const auto qkv = linear(
             normalized_hidden_state, qkv_weight, qkv_bias
         );
+        const auto split = split_qkv(qkv, config.channel_count());
+        constexpr size_t kInspectedHead = 0;
+        const auto query_head = extract_attention_head(
+            split.query, kInspectedHead, config.head_count()
+        );
+        const auto key_head = extract_attention_head(
+            split.key, kInspectedHead, config.head_count()
+        );
+        const auto value_head = extract_attention_head(
+            split.value, kInspectedHead, config.head_count()
+        );
 
         std::cout << "\ninput_token_id: " << kInspectedTokenId << '\n'
                   << "input_position: " << kInspectedPosition << '\n'
-                  << "transformer_layer: " << kInspectedLayer << '\n';
+                  << "transformer_layer: " << kInspectedLayer << '\n'
+                  << "attention_head: " << kInspectedHead << '\n'
+                  << "channels_per_head: " << query_head.size() << '\n';
         print_vector_preview("Token embedding", token_embedding);
         print_vector_preview("Position embedding", position_embedding);
         print_vector_preview("Initial hidden state", hidden_state);
@@ -616,6 +691,9 @@ namespace {
             "Normalized hidden state", normalized_hidden_state
         );
         print_vector_preview("Combined QKV projection", qkv);
+        print_vector_preview("Query head 0", query_head);
+        print_vector_preview("Key head 0", key_head);
+        print_vector_preview("Value head 0", value_head);
     }
 
 }  // namespace
