@@ -646,6 +646,9 @@ namespace {
         constexpr uint64_t kInspectedTokenId = 0;
         constexpr uint64_t kInspectedPosition = 0;
         constexpr uint64_t kInspectedLayer = 0;
+        std::cout << "\ninput_token_id: " << kInspectedTokenId << '\n'
+                  << "input_position: " << kInspectedPosition << '\n'
+                  << "transformer_layer: " << kInspectedLayer << '\n';
 
         // 5. Look up the token and position embeddings, then add them to form
         // the residual-stream input to the first Transformer block.
@@ -658,6 +661,9 @@ namespace {
         const auto hidden_state = add_elementwise(
             token_embedding, position_embedding
         );
+        print_vector_preview("Token embedding", token_embedding);
+        print_vector_preview("Position embedding", position_embedding);
+        print_vector_preview("Initial hidden state", hidden_state);
 
         // 6. Normalize the hidden state and apply layer 0's learned scale and
         // bias, producing the input expected by the attention projection.
@@ -669,6 +675,11 @@ namespace {
         );
         const auto normalized_hidden_state = layer_norm(
             hidden_state, layer_norm_weight, layer_norm_bias
+        );
+        print_vector_preview("First LayerNorm weight", layer_norm_weight);
+        print_vector_preview("First LayerNorm bias", layer_norm_bias);
+        print_vector_preview(
+            "Normalized hidden state", normalized_hidden_state
         );
 
         // 7. Apply one affine projection that produces the query, key, and
@@ -682,6 +693,7 @@ namespace {
         const auto qkv = linear(
             normalized_hidden_state, qkv_weight, qkv_bias
         );
+        print_vector_preview("Combined QKV projection", qkv);
 
         // 8. Separate Q, K, and V, then inspect one of the 12 attention heads.
         // Each head owns a contiguous 64-channel slice of all three vectors.
@@ -696,23 +708,8 @@ namespace {
         const auto value_head = extract_attention_head(
             split.value, kInspectedHead, config.head_count()
         );
-
-        // 9. Print short previews so each intermediate stage can be checked
-        // without dumping thousands of floating-point values.
-        std::cout << "\ninput_token_id: " << kInspectedTokenId << '\n'
-                  << "input_position: " << kInspectedPosition << '\n'
-                  << "transformer_layer: " << kInspectedLayer << '\n'
-                  << "attention_head: " << kInspectedHead << '\n'
+        std::cout << "\nattention_head: " << kInspectedHead << '\n'
                   << "channels_per_head: " << query_head.size() << '\n';
-        print_vector_preview("Token embedding", token_embedding);
-        print_vector_preview("Position embedding", position_embedding);
-        print_vector_preview("Initial hidden state", hidden_state);
-        print_vector_preview("First LayerNorm weight", layer_norm_weight);
-        print_vector_preview("First LayerNorm bias", layer_norm_bias);
-        print_vector_preview(
-            "Normalized hidden state", normalized_hidden_state
-        );
-        print_vector_preview("Combined QKV projection", qkv);
         print_vector_preview("Query head 0", query_head);
         print_vector_preview("Key head 0", key_head);
         print_vector_preview("Value head 0", value_head);
