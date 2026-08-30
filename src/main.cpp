@@ -280,20 +280,11 @@ namespace {
 
 
 int main(const int argc, char* argv[]) {
-    if (argc < 2 || argc > 3) {
-        std::cerr << "usage: " << argv[0]
-                  << " <checkpoint_path> [--list-tensors]\n";
-        return 1;
-    }
-
-    const bool list_tensors = argc == 3;
-    if (list_tensors && std::string_view{ argv[2] } != "--list-tensors") {
-        std::cerr << "error: unknown option: " << argv[2] << '\n';
-        return 1;
-    }
+    if (argc < 2)
+        return -1;
 
     try {
-        inspect_checkpoint(argv[1], list_tensors);
+        inspect_checkpoint(argv[1], true);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;
