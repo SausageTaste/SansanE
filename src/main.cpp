@@ -18,21 +18,6 @@
 
 namespace {
 
-    constexpr int32_t kCheckpointMagic = 20240326;
-    constexpr int32_t kCheckpointVersion = 3;
-    constexpr size_t kHeaderElementCount = 256;
-    constexpr uint64_t kHeaderBytes = kHeaderElementCount * sizeof(int32_t);
-    constexpr uint64_t kParameterBytes = sizeof(float);
-
-    struct Gpt2Config {
-        uint64_t max_sequence_length;
-        uint64_t vocabulary_size;
-        uint64_t padded_vocabulary_size;
-        uint64_t layer_count;
-        uint64_t head_count;
-        uint64_t channel_count;
-    };
-
     struct ParameterTensor {
         std::string_view name;
         std::vector<uint64_t> shape;
@@ -74,113 +59,240 @@ namespace {
         return static_cast<uint64_t>(value);
     }
 
-    Gpt2Config parse_config(
-        const std::array<int32_t, kHeaderElementCount>& header
-    ) {
-        if (header[0] != kCheckpointMagic) {
-            throw std::runtime_error(
-                "invalid checkpoint magic: expected " +
-                std::to_string(kCheckpointMagic) + ", got " +
-                std::to_string(header[0])
-            );
+
+    class Gpt2Config {
+
+    public:
+        constexpr static int32_t kCheckpointMagic = 20240326;
+        constexpr static int32_t kCheckpointVersion = 3;
+        constexpr static size_t kHeaderElementCount = 256;
+        constexpr static uint64_t kHeaderBytes = kHeaderElementCount *
+                                                 sizeof(int32_t);
+        constexpr static uint64_t kParameterBytes = sizeof(float);
+
+        using HeaderBuffer = std::array<int32_t, kHeaderElementCount>;
+
+    public:
+        static Gpt2Config create(const HeaderBuffer& header) {
+            Gpt2Config output;
+            output.parse(header);
+            output.layout_ = output.make_parameter_layout();
+            return output;
         }
-        if (header[1] != kCheckpointVersion) {
-            throw std::runtime_error(
-                "unsupported checkpoint version: expected " +
-                std::to_string(kCheckpointVersion) + ", got " +
-                std::to_string(header[1])
+
+        uint64_t parameter_count() const {
+            uint64_t total = 0;
+            for (auto& tensor : layout_) {
+                total = checked_add(total, tensor.element_count);
+            }
+            return total;
+        }
+
+        uint64_t expected_file_bytes() const {
+            return checked_add(
+                Gpt2Config::kHeaderBytes,
+                checked_multiply(
+                    { this->parameter_count(), Gpt2Config::kParameterBytes }
+                )
             );
         }
 
-        Gpt2Config config{
-            .max_sequence_length = positive_header_value(
+        std::vector<float> read_embedding_row(
+            const sung::Path& checkpoint_path, const uint64_t token_id
+        ) const {
+            if (layout_.front().shape.size() != 2 ||
+                layout_.front().shape[0] < vocabulary_size_ ||
+                layout_.front().shape[1] != channel_count_) {
+                throw std::runtime_error("invalid token embedding shape");
+            }
+            if (token_id >= vocabulary_size_) {
+                throw std::out_of_range(
+                    "token ID " + std::to_string(token_id) +
+                    " is outside the vocabulary"
+                );
+            }
+
+            const uint64_t row_bytes = checked_multiply(
+                { channel_count_, Gpt2Config::kParameterBytes }
+            );
+            const uint64_t row_offset = checked_add(
+                layout_.front().byte_offset,
+                checked_multiply({ token_id, row_bytes })
+            );
+
+            if (channel_count_ > std::numeric_limits<size_t>::max() ||
+                row_bytes > static_cast<uint64_t>(
+                                std::numeric_limits<std::streamsize>::max()
+                            ) ||
+                row_offset > static_cast<uint64_t>(
+                                 std::numeric_limits<std::streamoff>::max()
+                             )) {
+                throw std::overflow_error("embedding row is too large to read");
+            }
+
+            std::ifstream checkpoint{ checkpoint_path, std::ios::binary };
+            if (!checkpoint) {
+                throw std::runtime_error(
+                    "cannot open checkpoint: " + checkpoint_path.string()
+                );
+            }
+
+            checkpoint.seekg(static_cast<std::streamoff>(row_offset));
+            if (!checkpoint) {
+                throw std::runtime_error("cannot seek to token embedding row");
+            }
+
+            std::vector<float> embedding(static_cast<size_t>(channel_count_));
+            const auto bytes_to_read = static_cast<std::streamsize>(row_bytes);
+            checkpoint.read(
+                reinterpret_cast<char*>(embedding.data()), bytes_to_read
+            );
+            if (checkpoint.gcount() != bytes_to_read) {
+                throw std::runtime_error("incomplete token embedding row");
+            }
+            return embedding;
+        }
+
+        friend std::ostream& operator<<(
+            std::ostream& os, const Gpt2Config& config
+        );
+
+    private:
+        void parse(const HeaderBuffer& header) {
+            if (header[0] != kCheckpointMagic) {
+                throw std::runtime_error(
+                    "invalid checkpoint magic: expected " +
+                    std::to_string(kCheckpointMagic) + ", got " +
+                    std::to_string(header[0])
+                );
+            }
+            if (header[1] != kCheckpointVersion) {
+                throw std::runtime_error(
+                    "unsupported checkpoint version: expected " +
+                    std::to_string(kCheckpointVersion) + ", got " +
+                    std::to_string(header[1])
+                );
+            }
+
+            max_sequence_length_ = positive_header_value(
                 header[2], "max_seq_len"
-            ),
-            .vocabulary_size = positive_header_value(header[3], "vocab_size"),
-            .padded_vocabulary_size = positive_header_value(
+            );
+            vocabulary_size_ = positive_header_value(header[3], "vocab_size");
+            padded_vocabulary_size_ = positive_header_value(
                 header[7], "padded_vocab_size"
-            ),
-            .layer_count = positive_header_value(header[4], "num_layers"),
-            .head_count = positive_header_value(header[5], "num_heads"),
-            .channel_count = positive_header_value(header[6], "channels"),
-        };
-
-        if (config.padded_vocabulary_size < config.vocabulary_size) {
-            throw std::runtime_error(
-                "padded_vocab_size is smaller than vocab_size"
             );
+            layer_count_ = positive_header_value(header[4], "num_layers");
+            head_count_ = positive_header_value(header[5], "num_heads");
+            channel_count_ = positive_header_value(header[6], "channels");
+
+            if (padded_vocabulary_size_ < vocabulary_size_) {
+                throw std::runtime_error(
+                    "padded_vocab_size is smaller than vocab_size"
+                );
+            }
+            if (channel_count_ % head_count_ != 0) {
+                throw std::runtime_error(
+                    "channels is not divisible by num_heads"
+                );
+            }
         }
-        if (config.channel_count % config.head_count != 0) {
-            throw std::runtime_error("channels is not divisible by num_heads");
+
+        std::vector<ParameterTensor> make_parameter_layout() const {
+            const uint64_t max_t = max_sequence_length_;
+            const uint64_t vocabulary = padded_vocabulary_size_;
+            const uint64_t layers = layer_count_;
+            const uint64_t channels = channel_count_;
+
+            struct TensorDefinition {
+                std::string_view name;
+                std::initializer_list<uint64_t> shape;
+            };
+
+            const std::array<TensorDefinition, 16> definitions{
+                TensorDefinition{ "wte", { vocabulary, channels } },
+                TensorDefinition{ "wpe", { max_t, channels } },
+                TensorDefinition{ "ln1w", { layers, channels } },
+                TensorDefinition{ "ln1b", { layers, channels } },
+                TensorDefinition{ "qkvw", { layers, 3 * channels, channels } },
+                TensorDefinition{ "qkvb", { layers, 3 * channels } },
+                TensorDefinition{ "attprojw", { layers, channels, channels } },
+                TensorDefinition{ "attprojb", { layers, channels } },
+                TensorDefinition{ "ln2w", { layers, channels } },
+                TensorDefinition{ "ln2b", { layers, channels } },
+                TensorDefinition{ "fcw", { layers, 4 * channels, channels } },
+                TensorDefinition{ "fcb", { layers, 4 * channels } },
+                TensorDefinition{ "fcprojw",
+                                  { layers, channels, 4 * channels } },
+                TensorDefinition{ "fcprojb", { layers, channels } },
+                TensorDefinition{ "lnfw", { channels } },
+                TensorDefinition{ "lnfb", { channels } },
+            };
+
+            std::vector<ParameterTensor> layout;
+            layout.reserve(definitions.size());
+
+            uint64_t byte_offset = kHeaderBytes;
+            for (const TensorDefinition& definition : definitions) {
+                const uint64_t elements = checked_multiply(definition.shape);
+                layout.push_back(
+                    ParameterTensor{
+                        .name = definition.name,
+                        .shape = definition.shape,
+                        .element_count = elements,
+                        .byte_offset = byte_offset,
+                    }
+                );
+                byte_offset = checked_add(
+                    byte_offset, checked_multiply({ elements, kParameterBytes })
+                );
+            }
+            return layout;
         }
 
-        return config;
-    }
+        uint64_t max_sequence_length_;
+        uint64_t vocabulary_size_;
+        uint64_t padded_vocabulary_size_;
+        uint64_t layer_count_;
+        uint64_t head_count_;
+        uint64_t channel_count_;
 
-    std::vector<ParameterTensor> make_parameter_layout(
-        const Gpt2Config& config
-    ) {
-        const uint64_t max_t = config.max_sequence_length;
-        const uint64_t vocabulary = config.padded_vocabulary_size;
-        const uint64_t layers = config.layer_count;
-        const uint64_t channels = config.channel_count;
+        std::vector<ParameterTensor> layout_;
+    };
 
-        struct TensorDefinition {
-            std::string_view name;
-            std::initializer_list<uint64_t> shape;
-        };
+    std::ostream& operator<<(std::ostream& os, const Gpt2Config& config) {
+        os << "[GPT-2]\n"
+           << "max_seq_len: " << config.max_sequence_length_ << '\n'
+           << "vocab_size: " << config.vocabulary_size_ << '\n'
+           << "padded_vocab_size: " << config.padded_vocabulary_size_ << '\n'
+           << "num_layers: " << config.layer_count_ << '\n'
+           << "num_heads: " << config.head_count_ << '\n'
+           << "channels: " << config.channel_count_ << '\n'
+           << "num_parameters: " << config.parameter_count() << '\n';
 
-        const std::array<TensorDefinition, 16> definitions{
-            TensorDefinition{ "wte", { vocabulary, channels } },
-            TensorDefinition{ "wpe", { max_t, channels } },
-            TensorDefinition{ "ln1w", { layers, channels } },
-            TensorDefinition{ "ln1b", { layers, channels } },
-            TensorDefinition{ "qkvw", { layers, 3 * channels, channels } },
-            TensorDefinition{ "qkvb", { layers, 3 * channels } },
-            TensorDefinition{ "attprojw", { layers, channels, channels } },
-            TensorDefinition{ "attprojb", { layers, channels } },
-            TensorDefinition{ "ln2w", { layers, channels } },
-            TensorDefinition{ "ln2b", { layers, channels } },
-            TensorDefinition{ "fcw", { layers, 4 * channels, channels } },
-            TensorDefinition{ "fcb", { layers, 4 * channels } },
-            TensorDefinition{ "fcprojw", { layers, channels, 4 * channels } },
-            TensorDefinition{ "fcprojb", { layers, channels } },
-            TensorDefinition{ "lnfw", { channels } },
-            TensorDefinition{ "lnfb", { channels } },
-        };
+        os << "\n[Parameter tensors]\n"
+           << std::left << std::setw(12) << "name" << std::setw(22) << "shape"
+           << std::right << std::setw(14) << "elements" << std::setw(16)
+           << "byte_offset" << '\n';
 
-        std::vector<ParameterTensor> layout;
-        layout.reserve(definitions.size());
-
-        uint64_t byte_offset = kHeaderBytes;
-        for (const TensorDefinition& definition : definitions) {
-            const uint64_t elements = checked_multiply(definition.shape);
-            layout.push_back(
-                ParameterTensor{
-                    .name = definition.name,
-                    .shape = definition.shape,
-                    .element_count = elements,
-                    .byte_offset = byte_offset,
+        for (const ParameterTensor& tensor : config.layout_) {
+            std::string shape;
+            for (const uint64_t dimension : tensor.shape) {
+                if (!shape.empty()) {
+                    shape += " x ";
                 }
-            );
-            byte_offset = checked_add(
-                byte_offset, checked_multiply({ elements, kParameterBytes })
-            );
+                shape += std::to_string(dimension);
+            }
+
+            os << std::left << std::setw(12) << tensor.name << std::setw(22)
+               << shape << std::right << std::setw(14) << tensor.element_count
+               << std::setw(16) << tensor.byte_offset << '\n';
         }
-        return layout;
+
+        return os;
     }
 
-    uint64_t parameter_count(const std::vector<ParameterTensor>& layout) {
-        uint64_t total = 0;
-        for (const ParameterTensor& tensor : layout) {
-            total = checked_add(total, tensor.element_count);
-        }
-        return total;
-    }
 
-    std::array<int32_t, kHeaderElementCount> read_header(
-        const sung::Path& checkpoint_path
-    ) {
+    Gpt2Config::HeaderBuffer read_header(const sung::Path& checkpoint_path) {
         if constexpr (std::endian::native != std::endian::little) {
             throw std::runtime_error(
                 "this checkpoint reader currently requires a little-endian "
@@ -195,7 +307,7 @@ namespace {
             );
         }
 
-        std::array<int32_t, kHeaderElementCount> header{};
+        Gpt2Config::HeaderBuffer header{};
         checkpoint.read(
             reinterpret_cast<char*>(header.data()),
             static_cast<std::streamsize>(sizeof(header))
@@ -207,90 +319,6 @@ namespace {
             );
         }
         return header;
-    }
-
-    std::vector<float> read_embedding_row(
-        const sung::Path& checkpoint_path,
-        const ParameterTensor& embedding_tensor,
-        const uint64_t token_id,
-        const uint64_t vocabulary_size,
-        const uint64_t channel_count
-    ) {
-        if (embedding_tensor.shape.size() != 2 ||
-            embedding_tensor.shape[0] < vocabulary_size ||
-            embedding_tensor.shape[1] != channel_count) {
-            throw std::runtime_error("invalid token embedding shape");
-        }
-        if (token_id >= vocabulary_size) {
-            throw std::out_of_range(
-                "token ID " + std::to_string(token_id) +
-                " is outside the vocabulary"
-            );
-        }
-
-        const uint64_t row_bytes = checked_multiply(
-            { channel_count, kParameterBytes }
-        );
-        const uint64_t row_offset = checked_add(
-            embedding_tensor.byte_offset,
-            checked_multiply({ token_id, row_bytes })
-        );
-
-        if (channel_count > std::numeric_limits<size_t>::max() ||
-            row_bytes >
-                static_cast<uint64_t>(
-                    std::numeric_limits<std::streamsize>::max()
-                ) ||
-            row_offset >
-                static_cast<uint64_t>(
-                    std::numeric_limits<std::streamoff>::max()
-                )) {
-            throw std::overflow_error("embedding row is too large to read");
-        }
-
-        std::ifstream checkpoint{ checkpoint_path, std::ios::binary };
-        if (!checkpoint) {
-            throw std::runtime_error(
-                "cannot open checkpoint: " + checkpoint_path.string()
-            );
-        }
-
-        checkpoint.seekg(static_cast<std::streamoff>(row_offset));
-        if (!checkpoint) {
-            throw std::runtime_error("cannot seek to token embedding row");
-        }
-
-        std::vector<float> embedding(static_cast<size_t>(channel_count));
-        const auto bytes_to_read = static_cast<std::streamsize>(row_bytes);
-        checkpoint.read(
-            reinterpret_cast<char*>(embedding.data()), bytes_to_read
-        );
-        if (checkpoint.gcount() != bytes_to_read) {
-            throw std::runtime_error("incomplete token embedding row");
-        }
-        return embedding;
-    }
-
-    void print_parameter_layout(const std::vector<ParameterTensor>& layout) {
-        std::cout << "\n[Parameter tensors]\n"
-                  << std::left << std::setw(12) << "name" << std::setw(22)
-                  << "shape" << std::right << std::setw(14) << "elements"
-                  << std::setw(16) << "byte_offset" << '\n';
-
-        for (const ParameterTensor& tensor : layout) {
-            std::string shape;
-            for (const uint64_t dimension : tensor.shape) {
-                if (!shape.empty()) {
-                    shape += " x ";
-                }
-                shape += std::to_string(dimension);
-            }
-
-            std::cout << std::left << std::setw(12) << tensor.name
-                      << std::setw(22) << shape << std::right << std::setw(14)
-                      << tensor.element_count << std::setw(16)
-                      << tensor.byte_offset << '\n';
-        }
     }
 
     void print_embedding_row(
@@ -318,53 +346,31 @@ namespace {
         std::cout << '\n';
     }
 
-    void inspect_checkpoint(
-        const sung::Path& checkpoint_path, const bool list_tensors
-    ) {
+    void inspect_checkpoint(const sung::Path& checkpoint_path) {
         const auto header = read_header(checkpoint_path);
-        const Gpt2Config config = parse_config(header);
-        const std::vector<ParameterTensor> layout = make_parameter_layout(
-            config
-        );
-        const uint64_t parameters = parameter_count(layout);
-        const uint64_t expected_file_bytes = checked_add(
-            kHeaderBytes, checked_multiply({ parameters, kParameterBytes })
-        );
+        const auto config = Gpt2Config::create(header);
+
+        const uint64_t expected_file_bytes = config.expected_file_bytes();
         const uint64_t actual_file_bytes = std::filesystem::file_size(
             checkpoint_path
         );
-
         if (actual_file_bytes != expected_file_bytes) {
             throw std::runtime_error(
-                "checkpoint size mismatch: expected " +
-                std::to_string(expected_file_bytes) + " bytes, got " +
-                std::to_string(actual_file_bytes)
+                std::format(
+                    "checkpoint size mismatch: expected {} bytes, got {}",
+                    expected_file_bytes,
+                    actual_file_bytes
+                )
             );
         }
 
-        std::cout << "[GPT-2]\n"
-                  << "checkpoint: " << checkpoint_path << '\n'
-                  << "max_seq_len: " << config.max_sequence_length << '\n'
-                  << "vocab_size: " << config.vocabulary_size << '\n'
-                  << "padded_vocab_size: " << config.padded_vocabulary_size
-                  << '\n'
-                  << "num_layers: " << config.layer_count << '\n'
-                  << "num_heads: " << config.head_count << '\n'
-                  << "channels: " << config.channel_count << '\n'
-                  << "num_parameters: " << parameters << '\n'
-                  << "checkpoint_bytes: " << actual_file_bytes << '\n';
-
-        if (list_tensors) {
-            print_parameter_layout(layout);
-        }
+        std::cout << "checkpoint: " << checkpoint_path << '\n'
+                  << "checkpoint_bytes: " << actual_file_bytes << "\n\n"
+                  << config;
 
         constexpr uint64_t kInspectedTokenId = 0;
-        const std::vector<float> embedding = read_embedding_row(
-            checkpoint_path,
-            layout.front(),
-            kInspectedTokenId,
-            config.vocabulary_size,
-            config.channel_count
+        const auto embedding = config.read_embedding_row(
+            checkpoint_path, kInspectedTokenId
         );
         print_embedding_row(kInspectedTokenId, embedding);
     }
@@ -377,7 +383,7 @@ int main(const int argc, char* argv[]) {
         return -1;
 
     try {
-        inspect_checkpoint(argv[1], true);
+        inspect_checkpoint(argv[1]);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;
