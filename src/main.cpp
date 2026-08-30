@@ -12,6 +12,8 @@
 #include <string_view>
 #include <vector>
 
+#include "auxiliary/path.hpp"
+
 
 namespace {
 
@@ -181,7 +183,7 @@ namespace {
     }
 
     std::array<std::int32_t, kHeaderElementCount> read_header(
-        const std::filesystem::path& checkpoint_path
+        const sung::Path& checkpoint_path
     ) {
         if constexpr (std::endian::native != std::endian::little) {
             throw std::runtime_error(
@@ -234,7 +236,7 @@ namespace {
     }
 
     void inspect_checkpoint(
-        const std::filesystem::path& checkpoint_path, const bool list_tensors
+        const sung::Path& checkpoint_path, const bool list_tensors
     ) {
         const auto header = read_header(checkpoint_path);
         const Gpt2Config config = parse_config(header);
