@@ -107,9 +107,9 @@ namespace {
             return static_cast<size_t>(channel_count_);
         }
 
-        size_t head_count() const {
-            return static_cast<size_t>(head_count_);
-        }
+        size_t head_count() const { return static_cast<size_t>(head_count_); }
+
+        size_t layer_count() const { return static_cast<size_t>(layer_count_); }
 
         std::vector<float> read_token_embedding(
             const sung::Path& checkpoint_path, const uint64_t token_id
@@ -201,6 +201,72 @@ namespace {
             return read_tensor_row(checkpoint_path, layout_[7], layer_index);
         }
 
+        std::vector<float> read_second_layer_norm_weight(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            return read_tensor_row(checkpoint_path, layout_[8], layer_index);
+        }
+
+        std::vector<float> read_second_layer_norm_bias(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            return read_tensor_row(checkpoint_path, layout_[9], layer_index);
+        }
+
+        std::vector<float> read_mlp_expansion_weight(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            const uint64_t elements_per_layer = checked_multiply(
+                { 4, channel_count_, channel_count_ }
+            );
+            return read_tensor_elements(
+                checkpoint_path,
+                layout_[10],
+                checked_multiply({ layer_index, elements_per_layer }),
+                elements_per_layer
+            );
+        }
+
+        std::vector<float> read_mlp_expansion_bias(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            const uint64_t elements_per_layer = checked_multiply(
+                { 4, channel_count_ }
+            );
+            return read_tensor_elements(
+                checkpoint_path,
+                layout_[11],
+                checked_multiply({ layer_index, elements_per_layer }),
+                elements_per_layer
+            );
+        }
+
+        std::vector<float> read_mlp_projection_weight(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            const uint64_t elements_per_layer = checked_multiply(
+                { 4, channel_count_, channel_count_ }
+            );
+            return read_tensor_elements(
+                checkpoint_path,
+                layout_[12],
+                checked_multiply({ layer_index, elements_per_layer }),
+                elements_per_layer
+            );
+        }
+
+        std::vector<float> read_mlp_projection_bias(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            return read_tensor_row(checkpoint_path, layout_[13], layer_index);
+        }
+
         friend std::ostream& operator<<(
             std::ostream& os, const Gpt2Config& config
         );
@@ -267,14 +333,12 @@ namespace {
             );
 
             if (element_count > std::numeric_limits<size_t>::max() ||
-                bytes_to_read >
-                    static_cast<uint64_t>(
-                        std::numeric_limits<std::streamsize>::max()
-                    ) ||
-                byte_offset >
-                    static_cast<uint64_t>(
-                        std::numeric_limits<std::streamoff>::max()
-                    )) {
+                bytes_to_read > static_cast<uint64_t>(
+                                    std::numeric_limits<std::streamsize>::max()
+                                ) ||
+                byte_offset > static_cast<uint64_t>(
+                                  std::numeric_limits<std::streamoff>::max()
+                              )) {
                 throw std::overflow_error(
                     "range from tensor " + std::string{ tensor.name } +
                     " is too large to read"
@@ -304,8 +368,7 @@ namespace {
             );
             if (checkpoint.gcount() != stream_size) {
                 throw std::runtime_error(
-                    "incomplete range from tensor " +
-                    std::string{ tensor.name }
+                    "incomplete range from tensor " + std::string{ tensor.name }
                 );
             }
             return elements;
@@ -563,6 +626,23 @@ namespace {
         return output;
     }
 
+    std::vector<float> gelu(const std::vector<float>& input) {
+        constexpr float kScalingFactor = 0.7978845608028654F;
+        constexpr float kCubicCoefficient = 0.044715F;
+
+        std::vector<float> output(input.size());
+        for (size_t index = 0; index < input.size(); ++index) {
+            const float value = input[index];
+            const float cubic = value * value * value;
+            output[index] = 0.5F * value *
+                            (1.0F + std::tanh(
+                                        kScalingFactor *
+                                        (value + kCubicCoefficient * cubic)
+                                    ));
+        }
+        return output;
+    }
+
     QkvVectors split_qkv(
         const std::vector<float>& combined, const size_t channel_count
     ) {
@@ -599,7 +679,9 @@ namespace {
             );
         }
         if (head_index >= head_count) {
-            throw std::out_of_range("attention head index is outside the model");
+            throw std::out_of_range(
+                "attention head index is outside the model"
+            );
         }
 
         const size_t channels_per_head = channels.size() / head_count;
@@ -738,6 +820,101 @@ namespace {
         return output;
     }
 
+    std::vector<float> single_token_transformer_block(
+        const sung::Path& checkpoint_path,
+        const Gpt2Config& config,
+        const std::vector<float>& input,
+        const size_t layer_index
+    ) {
+        if (input.size() != config.channel_count()) {
+            throw std::invalid_argument(
+                "Transformer block input does not match channel count"
+            );
+        }
+
+        // 1. GPT-2 uses pre-normalization: attention receives a normalized
+        // copy while the original residual stream bypasses the operation.
+        const auto first_norm_weight = config.read_first_layer_norm_weight(
+            checkpoint_path, layer_index
+        );
+        const auto first_norm_bias = config.read_first_layer_norm_bias(
+            checkpoint_path, layer_index
+        );
+        const auto normalized_for_attention = layer_norm(
+            input, first_norm_weight, first_norm_bias
+        );
+
+        // 2. Produce Q, K, and V together. Splitting the combined projection
+        // gives each attention head its query, key, and value channels.
+        const auto qkv_weight = config.read_qkv_projection_weight(
+            checkpoint_path, layer_index
+        );
+        const auto qkv_bias = config.read_qkv_projection_bias(
+            checkpoint_path, layer_index
+        );
+        const auto combined_qkv = linear(
+            normalized_for_attention, qkv_weight, qkv_bias
+        );
+        const auto qkv = split_qkv(combined_qkv, config.channel_count());
+
+        // 3. Run scaled dot-product attention independently in every head and
+        // concatenate the head outputs back into one channel vector.
+        const auto attention = single_token_multi_head_attention(
+            qkv, config.head_count()
+        );
+
+        // 4. The attention projection mixes information across heads. The
+        // first residual addition preserves the block input alongside it.
+        const auto attention_weight = config.read_attention_projection_weight(
+            checkpoint_path, layer_index
+        );
+        const auto attention_bias = config.read_attention_projection_bias(
+            checkpoint_path, layer_index
+        );
+        const auto projected_attention = linear(
+            attention, attention_weight, attention_bias
+        );
+        const auto post_attention = add_elementwise(input, projected_attention);
+
+        // 5. A second pre-normalization prepares the residual stream for the
+        // block's feed-forward MLP without modifying the residual bypass.
+        const auto second_norm_weight = config.read_second_layer_norm_weight(
+            checkpoint_path, layer_index
+        );
+        const auto second_norm_bias = config.read_second_layer_norm_bias(
+            checkpoint_path, layer_index
+        );
+        const auto normalized_for_mlp = layer_norm(
+            post_attention, second_norm_weight, second_norm_bias
+        );
+
+        // 6. Expand 768 channels to 3072, apply GPT-2's approximate GELU
+        // activation, then project the result back down to 768 channels.
+        const auto expansion_weight = config.read_mlp_expansion_weight(
+            checkpoint_path, layer_index
+        );
+        const auto expansion_bias = config.read_mlp_expansion_bias(
+            checkpoint_path, layer_index
+        );
+        const auto expanded = linear(
+            normalized_for_mlp, expansion_weight, expansion_bias
+        );
+        const auto activated = gelu(expanded);
+        const auto projection_weight = config.read_mlp_projection_weight(
+            checkpoint_path, layer_index
+        );
+        const auto projection_bias = config.read_mlp_projection_bias(
+            checkpoint_path, layer_index
+        );
+        const auto projected_mlp = linear(
+            activated, projection_weight, projection_bias
+        );
+
+        // 7. The second residual addition completes this Transformer block and
+        // supplies the input residual stream for the following layer.
+        return add_elementwise(post_attention, projected_mlp);
+    }
+
     void print_vector_preview(
         const std::string_view title, const std::vector<float>& values
     ) {
@@ -790,14 +967,12 @@ namespace {
                   << "checkpoint_bytes: " << actual_file_bytes << "\n\n"
                   << config;
 
-        // 4. Select one token, position, and Transformer layer for this
-        // incremental inspection. A tokenizer will eventually supply IDs.
+        // 4. Select one token and position for this incremental inspection. A
+        // tokenizer will eventually supply token IDs for a complete sequence.
         constexpr uint64_t kInspectedTokenId = 0;
         constexpr uint64_t kInspectedPosition = 0;
-        constexpr uint64_t kInspectedLayer = 0;
         std::cout << "\ninput_token_id: " << kInspectedTokenId << '\n'
-                  << "input_position: " << kInspectedPosition << '\n'
-                  << "transformer_layer: " << kInspectedLayer << '\n';
+                  << "input_position: " << kInspectedPosition << '\n';
 
         // 5. Look up the token and position embeddings, then add them to form
         // the residual-stream input to the first Transformer block.
@@ -807,116 +982,22 @@ namespace {
         const auto position_embedding = config.read_position_embedding(
             checkpoint_path, kInspectedPosition
         );
-        const auto hidden_state = add_elementwise(
+        auto hidden_state = add_elementwise(
             token_embedding, position_embedding
         );
         print_vector_preview("Token embedding", token_embedding);
         print_vector_preview("Position embedding", position_embedding);
         print_vector_preview("Initial hidden state", hidden_state);
 
-        // 6. Normalize the hidden state and apply layer 0's learned scale and
-        // bias, producing the input expected by the attention projection.
-        const auto layer_norm_weight = config.read_first_layer_norm_weight(
-            checkpoint_path, kInspectedLayer
-        );
-        const auto layer_norm_bias = config.read_first_layer_norm_bias(
-            checkpoint_path, kInspectedLayer
-        );
-        const auto normalized_hidden_state = layer_norm(
-            hidden_state, layer_norm_weight, layer_norm_bias
-        );
-        print_vector_preview("First LayerNorm weight", layer_norm_weight);
-        print_vector_preview("First LayerNorm bias", layer_norm_bias);
-        print_vector_preview(
-            "Normalized hidden state", normalized_hidden_state
-        );
-
-        // 7. Apply one affine projection that produces the query, key, and
-        // value channels together: 768 input values become 3 * 768 values.
-        const auto qkv_weight = config.read_qkv_projection_weight(
-            checkpoint_path, kInspectedLayer
-        );
-        const auto qkv_bias = config.read_qkv_projection_bias(
-            checkpoint_path, kInspectedLayer
-        );
-        const auto qkv = linear(
-            normalized_hidden_state, qkv_weight, qkv_bias
-        );
-        print_vector_preview("Combined QKV projection", qkv);
-
-        // 8. Separate Q, K, and V, then inspect one of the 12 attention heads.
-        // Each head owns a contiguous 64-channel slice of all three vectors.
-        const auto split = split_qkv(qkv, config.channel_count());
-        constexpr size_t kInspectedHead = 0;
-        const auto query_head = extract_attention_head(
-            split.query, kInspectedHead, config.head_count()
-        );
-        const auto key_head = extract_attention_head(
-            split.key, kInspectedHead, config.head_count()
-        );
-        const auto value_head = extract_attention_head(
-            split.value, kInspectedHead, config.head_count()
-        );
-        std::cout << "\nattention_head: " << kInspectedHead << '\n'
-                  << "channels_per_head: " << query_head.size() << '\n';
-        print_vector_preview("Query head 0", query_head);
-        print_vector_preview("Key head 0", key_head);
-        print_vector_preview("Value head 0", value_head);
-
-        // 9. Measure how strongly this token's query matches its own key. The
-        // square-root scaling keeps scores from growing with the head width.
-        const std::vector<float> attention_scores{
-            scaled_attention_score(query_head, key_head)
-        };
-        std::cout << "\nquery_position: " << kInspectedPosition << '\n'
-                  << "key_position: " << kInspectedPosition << '\n';
-        print_vector_preview("Scaled attention scores", attention_scores);
-
-        // 10. Convert all causally allowed scores into probabilities, then
-        // blend their value vectors with those probabilities. Position 0 has
-        // only itself available, so softmax([-0.788...]) is exactly [1].
-        const auto attention_probabilities = softmax(attention_scores);
-        const auto attention_output = weighted_value_sum(
-            attention_probabilities, value_head, value_head.size()
-        );
-        print_vector_preview(
-            "Attention probabilities", attention_probabilities
-        );
-        print_vector_preview("Attention head output", attention_output);
-
-        // 11. Repeat the same attention calculation independently for every
-        // head, then concatenate the 12 outputs back into 768 channels.
-        const auto multi_head_attention_output =
-            single_token_multi_head_attention(split, config.head_count());
-        print_vector_preview(
-            "Concatenated attention heads", multi_head_attention_output
-        );
-
-        // 12. Mix information from all heads with the learned attention output
-        // projection, returning from 768 concatenated channels to 768 channels.
-        const auto attention_projection_weight =
-            config.read_attention_projection_weight(
-                checkpoint_path, kInspectedLayer
+        // 6. Pass this single-token residual stream through every Transformer
+        // block. Each iteration selects a different layer's parameter slices.
+        for (size_t layer = 0; layer < config.layer_count(); ++layer) {
+            hidden_state = single_token_transformer_block(
+                checkpoint_path, config, hidden_state, layer
             );
-        const auto attention_projection_bias =
-            config.read_attention_projection_bias(
-                checkpoint_path, kInspectedLayer
-            );
-        const auto projected_attention = linear(
-            multi_head_attention_output,
-            attention_projection_weight,
-            attention_projection_bias
-        );
-        print_vector_preview("Projected attention", projected_attention);
-
-        // 13. Preserve the block input through a residual connection. This
-        // sum becomes the residual stream consumed by the block's second norm.
-        const auto post_attention_hidden_state = add_elementwise(
-            hidden_state, projected_attention
-        );
-        print_vector_preview(
-            "Post-attention hidden state", post_attention_hidden_state
-        );
+            std::cout << "\ntransformer_layer: " << layer << '\n';
+            print_vector_preview("Transformer block output", hidden_state);
+        }
     }
 
 }  // namespace
