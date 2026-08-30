@@ -614,9 +614,13 @@ namespace {
     }
 
     void inspect_checkpoint(const sung::Path& checkpoint_path) {
+        // 1. Read the fixed-size header, validate the GPT-2 format, and use
+        // its model dimensions to reconstruct every parameter's file offset.
         const auto header = read_header(checkpoint_path);
         const auto config = Gpt2Config::create(header);
 
+        // 2. Verify that the reconstructed parameter layout accounts for the
+        // entire file, catching truncated or incompatible checkpoints.
         const uint64_t expected_file_bytes = config.expected_file_bytes();
         const uint64_t actual_file_bytes = std::filesystem::file_size(
             checkpoint_path
@@ -631,13 +635,20 @@ namespace {
             );
         }
 
+        // 3. Show the validated model dimensions and parameter layout before
+        // reading individual weights.
         std::cout << "checkpoint: " << checkpoint_path << '\n'
                   << "checkpoint_bytes: " << actual_file_bytes << "\n\n"
                   << config;
 
+        // 4. Select one token, position, and Transformer layer for this
+        // incremental inspection. A tokenizer will eventually supply IDs.
         constexpr uint64_t kInspectedTokenId = 0;
         constexpr uint64_t kInspectedPosition = 0;
         constexpr uint64_t kInspectedLayer = 0;
+
+        // 5. Look up the token and position embeddings, then add them to form
+        // the residual-stream input to the first Transformer block.
         const auto token_embedding = config.read_token_embedding(
             checkpoint_path, kInspectedTokenId
         );
@@ -647,6 +658,9 @@ namespace {
         const auto hidden_state = add_elementwise(
             token_embedding, position_embedding
         );
+
+        // 6. Normalize the hidden state and apply layer 0's learned scale and
+        // bias, producing the input expected by the attention projection.
         const auto layer_norm_weight = config.read_first_layer_norm_weight(
             checkpoint_path, kInspectedLayer
         );
@@ -656,6 +670,9 @@ namespace {
         const auto normalized_hidden_state = layer_norm(
             hidden_state, layer_norm_weight, layer_norm_bias
         );
+
+        // 7. Apply one affine projection that produces the query, key, and
+        // value channels together: 768 input values become 3 * 768 values.
         const auto qkv_weight = config.read_qkv_projection_weight(
             checkpoint_path, kInspectedLayer
         );
@@ -665,6 +682,9 @@ namespace {
         const auto qkv = linear(
             normalized_hidden_state, qkv_weight, qkv_bias
         );
+
+        // 8. Separate Q, K, and V, then inspect one of the 12 attention heads.
+        // Each head owns a contiguous 64-channel slice of all three vectors.
         const auto split = split_qkv(qkv, config.channel_count());
         constexpr size_t kInspectedHead = 0;
         const auto query_head = extract_attention_head(
@@ -677,6 +697,8 @@ namespace {
             split.value, kInspectedHead, config.head_count()
         );
 
+        // 9. Print short previews so each intermediate stage can be checked
+        // without dumping thousands of floating-point values.
         std::cout << "\ninput_token_id: " << kInspectedTokenId << '\n'
                   << "input_position: " << kInspectedPosition << '\n'
                   << "transformer_layer: " << kInspectedLayer << '\n'
