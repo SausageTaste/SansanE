@@ -97,18 +97,49 @@ namespace {
             );
         }
 
-        std::vector<float> read_embedding_row(
+        std::vector<float> read_token_embedding(
             const sung::Path& checkpoint_path, const uint64_t token_id
         ) const {
-            if (layout_.front().shape.size() != 2 ||
-                layout_.front().shape[0] < vocabulary_size_ ||
-                layout_.front().shape[1] != channel_count_) {
-                throw std::runtime_error("invalid token embedding shape");
-            }
             if (token_id >= vocabulary_size_) {
                 throw std::out_of_range(
                     "token ID " + std::to_string(token_id) +
                     " is outside the vocabulary"
+                );
+            }
+            return read_tensor_row(checkpoint_path, layout_[0], token_id);
+        }
+
+        std::vector<float> read_position_embedding(
+            const sung::Path& checkpoint_path, const uint64_t position
+        ) const {
+            if (position >= max_sequence_length_) {
+                throw std::out_of_range(
+                    "position " + std::to_string(position) +
+                    " is outside the maximum sequence length"
+                );
+            }
+            return read_tensor_row(checkpoint_path, layout_[1], position);
+        }
+
+        friend std::ostream& operator<<(
+            std::ostream& os, const Gpt2Config& config
+        );
+
+    private:
+        std::vector<float> read_tensor_row(
+            const sung::Path& checkpoint_path,
+            const ParameterTensor& tensor,
+            const uint64_t row_index
+        ) const {
+            if (tensor.shape.size() != 2 ||
+                tensor.shape[1] != channel_count_) {
+                throw std::runtime_error(
+                    "invalid shape for tensor " + std::string{ tensor.name }
+                );
+            }
+            if (row_index >= tensor.shape[0]) {
+                throw std::out_of_range(
+                    "row index is outside tensor " + std::string{ tensor.name }
                 );
             }
 
@@ -116,8 +147,7 @@ namespace {
                 { channel_count_, Gpt2Config::kParameterBytes }
             );
             const uint64_t row_offset = checked_add(
-                layout_.front().byte_offset,
-                checked_multiply({ token_id, row_bytes })
+                tensor.byte_offset, checked_multiply({ row_index, row_bytes })
             );
 
             if (channel_count_ > std::numeric_limits<size_t>::max() ||
@@ -127,7 +157,10 @@ namespace {
                 row_offset > static_cast<uint64_t>(
                                  std::numeric_limits<std::streamoff>::max()
                              )) {
-                throw std::overflow_error("embedding row is too large to read");
+                throw std::overflow_error(
+                    "row from tensor " + std::string{ tensor.name } +
+                    " is too large to read"
+                );
             }
 
             std::ifstream checkpoint{ checkpoint_path, std::ios::binary };
@@ -139,25 +172,22 @@ namespace {
 
             checkpoint.seekg(static_cast<std::streamoff>(row_offset));
             if (!checkpoint) {
-                throw std::runtime_error("cannot seek to token embedding row");
+                throw std::runtime_error(
+                    "cannot seek to tensor " + std::string{ tensor.name }
+                );
             }
 
-            std::vector<float> embedding(static_cast<size_t>(channel_count_));
+            std::vector<float> row(static_cast<size_t>(channel_count_));
             const auto bytes_to_read = static_cast<std::streamsize>(row_bytes);
-            checkpoint.read(
-                reinterpret_cast<char*>(embedding.data()), bytes_to_read
-            );
+            checkpoint.read(reinterpret_cast<char*>(row.data()), bytes_to_read);
             if (checkpoint.gcount() != bytes_to_read) {
-                throw std::runtime_error("incomplete token embedding row");
+                throw std::runtime_error(
+                    "incomplete row from tensor " + std::string{ tensor.name }
+                );
             }
-            return embedding;
+            return row;
         }
 
-        friend std::ostream& operator<<(
-            std::ostream& os, const Gpt2Config& config
-        );
-
-    private:
         void parse(const HeaderBuffer& header) {
             if (header[0] != kCheckpointMagic) {
                 throw std::runtime_error(
@@ -321,11 +351,27 @@ namespace {
         return header;
     }
 
-    void print_embedding_row(
-        const uint64_t token_id, const std::vector<float>& embedding
+    std::vector<float> add_elementwise(
+        const std::vector<float>& left, const std::vector<float>& right
+    ) {
+        if (left.size() != right.size()) {
+            throw std::invalid_argument(
+                "cannot add vectors with different dimensions"
+            );
+        }
+
+        std::vector<float> result(left.size());
+        for (size_t index = 0; index < result.size(); ++index) {
+            result[index] = left[index] + right[index];
+        }
+        return result;
+    }
+
+    void print_vector_preview(
+        const std::string_view title, const std::vector<float>& values
     ) {
         bool all_finite = true;
-        for (const float value : embedding) {
+        for (const float value : values) {
             if (!std::isfinite(value)) {
                 all_finite = false;
                 break;
@@ -333,15 +379,14 @@ namespace {
         }
 
         constexpr size_t kPreviewElementCount = 8;
-        std::cout << "\n[Token embedding]\n"
-                  << "token_id: " << token_id << '\n'
-                  << "dimensions: " << embedding.size() << '\n'
+        std::cout << "\n[" << title << "]\n"
+                  << "dimensions: " << values.size() << '\n'
                   << "all_finite: " << std::boolalpha << all_finite << '\n'
                   << "first_values:" << std::fixed << std::setprecision(7);
         for (size_t index = 0;
-             index < embedding.size() && index < kPreviewElementCount;
+             index < values.size() && index < kPreviewElementCount;
              ++index) {
-            std::cout << ' ' << embedding[index];
+            std::cout << ' ' << values[index];
         }
         std::cout << '\n';
     }
@@ -369,10 +414,22 @@ namespace {
                   << config;
 
         constexpr uint64_t kInspectedTokenId = 0;
-        const auto embedding = config.read_embedding_row(
+        constexpr uint64_t kInspectedPosition = 0;
+        const auto token_embedding = config.read_token_embedding(
             checkpoint_path, kInspectedTokenId
         );
-        print_embedding_row(kInspectedTokenId, embedding);
+        const auto position_embedding = config.read_position_embedding(
+            checkpoint_path, kInspectedPosition
+        );
+        const auto hidden_state = add_elementwise(
+            token_embedding, position_embedding
+        );
+
+        std::cout << "\ninput_token_id: " << kInspectedTokenId << '\n'
+                  << "input_position: " << kInspectedPosition << '\n';
+        print_vector_preview("Token embedding", token_embedding);
+        print_vector_preview("Position embedding", position_embedding);
+        print_vector_preview("Initial hidden state", hidden_state);
     }
 
 }  // namespace
