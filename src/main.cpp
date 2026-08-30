@@ -1,5 +1,6 @@
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -208,6 +209,68 @@ namespace {
         return header;
     }
 
+    std::vector<float> read_embedding_row(
+        const sung::Path& checkpoint_path,
+        const ParameterTensor& embedding_tensor,
+        const uint64_t token_id,
+        const uint64_t vocabulary_size,
+        const uint64_t channel_count
+    ) {
+        if (embedding_tensor.shape.size() != 2 ||
+            embedding_tensor.shape[0] < vocabulary_size ||
+            embedding_tensor.shape[1] != channel_count) {
+            throw std::runtime_error("invalid token embedding shape");
+        }
+        if (token_id >= vocabulary_size) {
+            throw std::out_of_range(
+                "token ID " + std::to_string(token_id) +
+                " is outside the vocabulary"
+            );
+        }
+
+        const uint64_t row_bytes = checked_multiply(
+            { channel_count, kParameterBytes }
+        );
+        const uint64_t row_offset = checked_add(
+            embedding_tensor.byte_offset,
+            checked_multiply({ token_id, row_bytes })
+        );
+
+        if (channel_count > std::numeric_limits<size_t>::max() ||
+            row_bytes >
+                static_cast<uint64_t>(
+                    std::numeric_limits<std::streamsize>::max()
+                ) ||
+            row_offset >
+                static_cast<uint64_t>(
+                    std::numeric_limits<std::streamoff>::max()
+                )) {
+            throw std::overflow_error("embedding row is too large to read");
+        }
+
+        std::ifstream checkpoint{ checkpoint_path, std::ios::binary };
+        if (!checkpoint) {
+            throw std::runtime_error(
+                "cannot open checkpoint: " + checkpoint_path.string()
+            );
+        }
+
+        checkpoint.seekg(static_cast<std::streamoff>(row_offset));
+        if (!checkpoint) {
+            throw std::runtime_error("cannot seek to token embedding row");
+        }
+
+        std::vector<float> embedding(static_cast<size_t>(channel_count));
+        const auto bytes_to_read = static_cast<std::streamsize>(row_bytes);
+        checkpoint.read(
+            reinterpret_cast<char*>(embedding.data()), bytes_to_read
+        );
+        if (checkpoint.gcount() != bytes_to_read) {
+            throw std::runtime_error("incomplete token embedding row");
+        }
+        return embedding;
+    }
+
     void print_parameter_layout(const std::vector<ParameterTensor>& layout) {
         std::cout << "\n[Parameter tensors]\n"
                   << std::left << std::setw(12) << "name" << std::setw(22)
@@ -228,6 +291,31 @@ namespace {
                       << tensor.element_count << std::setw(16)
                       << tensor.byte_offset << '\n';
         }
+    }
+
+    void print_embedding_row(
+        const uint64_t token_id, const std::vector<float>& embedding
+    ) {
+        bool all_finite = true;
+        for (const float value : embedding) {
+            if (!std::isfinite(value)) {
+                all_finite = false;
+                break;
+            }
+        }
+
+        constexpr size_t kPreviewElementCount = 8;
+        std::cout << "\n[Token embedding]\n"
+                  << "token_id: " << token_id << '\n'
+                  << "dimensions: " << embedding.size() << '\n'
+                  << "all_finite: " << std::boolalpha << all_finite << '\n'
+                  << "first_values:" << std::fixed << std::setprecision(7);
+        for (size_t index = 0;
+             index < embedding.size() && index < kPreviewElementCount;
+             ++index) {
+            std::cout << ' ' << embedding[index];
+        }
+        std::cout << '\n';
     }
 
     void inspect_checkpoint(
@@ -269,6 +357,16 @@ namespace {
         if (list_tensors) {
             print_parameter_layout(layout);
         }
+
+        constexpr uint64_t kInspectedTokenId = 0;
+        const std::vector<float> embedding = read_embedding_row(
+            checkpoint_path,
+            layout.front(),
+            kInspectedTokenId,
+            config.vocabulary_size,
+            config.channel_count
+        );
+        print_embedding_row(kInspectedTokenId, embedding);
     }
 
 }  // namespace
