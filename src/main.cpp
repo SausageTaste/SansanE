@@ -121,18 +121,40 @@ namespace {
             return read_tensor_row(checkpoint_path, layout_[1], position);
         }
 
+        std::vector<float> read_first_layer_norm_weight(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            return read_tensor_row(checkpoint_path, layout_[2], layer_index);
+        }
+
+        std::vector<float> read_first_layer_norm_bias(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            return read_tensor_row(checkpoint_path, layout_[3], layer_index);
+        }
+
         friend std::ostream& operator<<(
             std::ostream& os, const Gpt2Config& config
         );
 
     private:
+        void validate_layer_index(const uint64_t layer_index) const {
+            if (layer_index >= layer_count_) {
+                throw std::out_of_range(
+                    "layer index " + std::to_string(layer_index) +
+                    " is outside the model"
+                );
+            }
+        }
+
         std::vector<float> read_tensor_row(
             const sung::Path& checkpoint_path,
             const ParameterTensor& tensor,
             const uint64_t row_index
         ) const {
-            if (tensor.shape.size() != 2 ||
-                tensor.shape[1] != channel_count_) {
+            if (tensor.shape.size() != 2 || tensor.shape[1] != channel_count_) {
                 throw std::runtime_error(
                     "invalid shape for tensor " + std::string{ tensor.name }
                 );
@@ -367,6 +389,45 @@ namespace {
         return result;
     }
 
+    std::vector<float> layer_norm(
+        const std::vector<float>& input,
+        const std::vector<float>& weight,
+        const std::vector<float>& bias,
+        const float epsilon = 1e-5F
+    ) {
+        if (input.empty()) {
+            throw std::invalid_argument("cannot normalize an empty vector");
+        }
+        if (input.size() != weight.size() || input.size() != bias.size()) {
+            throw std::invalid_argument(
+                "LayerNorm input, weight, and bias dimensions do not match"
+            );
+        }
+
+        float mean = 0.0F;
+        for (const float value : input) {
+            mean += value;
+        }
+        mean /= static_cast<float>(input.size());
+
+        float variance = 0.0F;
+        for (const float value : input) {
+            const float difference = value - mean;
+            variance += difference * difference;
+        }
+        variance /= static_cast<float>(input.size());
+
+        const float inverse_standard_deviation = 1.0F /
+                                                 std::sqrt(variance + epsilon);
+        std::vector<float> output(input.size());
+        for (size_t index = 0; index < output.size(); ++index) {
+            const float normalized = (input[index] - mean) *
+                                     inverse_standard_deviation;
+            output[index] = normalized * weight[index] + bias[index];
+        }
+        return output;
+    }
+
     void print_vector_preview(
         const std::string_view title, const std::vector<float>& values
     ) {
@@ -415,6 +476,7 @@ namespace {
 
         constexpr uint64_t kInspectedTokenId = 0;
         constexpr uint64_t kInspectedPosition = 0;
+        constexpr uint64_t kInspectedLayer = 0;
         const auto token_embedding = config.read_token_embedding(
             checkpoint_path, kInspectedTokenId
         );
@@ -424,12 +486,27 @@ namespace {
         const auto hidden_state = add_elementwise(
             token_embedding, position_embedding
         );
+        const auto layer_norm_weight = config.read_first_layer_norm_weight(
+            checkpoint_path, kInspectedLayer
+        );
+        const auto layer_norm_bias = config.read_first_layer_norm_bias(
+            checkpoint_path, kInspectedLayer
+        );
+        const auto normalized_hidden_state = layer_norm(
+            hidden_state, layer_norm_weight, layer_norm_bias
+        );
 
         std::cout << "\ninput_token_id: " << kInspectedTokenId << '\n'
-                  << "input_position: " << kInspectedPosition << '\n';
+                  << "input_position: " << kInspectedPosition << '\n'
+                  << "transformer_layer: " << kInspectedLayer << '\n';
         print_vector_preview("Token embedding", token_embedding);
         print_vector_preview("Position embedding", position_embedding);
         print_vector_preview("Initial hidden state", hidden_state);
+        print_vector_preview("First LayerNorm weight", layer_norm_weight);
+        print_vector_preview("First LayerNorm bias", layer_norm_bias);
+        print_vector_preview(
+            "Normalized hidden state", normalized_hidden_state
+        );
     }
 
 }  // namespace
