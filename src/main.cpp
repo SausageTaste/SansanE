@@ -589,6 +589,30 @@ namespace {
         return output;
     }
 
+    float dot_product(
+        const std::vector<float>& left, const std::vector<float>& right
+    ) {
+        if (left.empty() || left.size() != right.size()) {
+            throw std::invalid_argument(
+                "dot-product vectors must have equal, nonzero dimensions"
+            );
+        }
+
+        float result = 0.0F;
+        for (size_t index = 0; index < left.size(); ++index) {
+            result += left[index] * right[index];
+        }
+        return result;
+    }
+
+    float scaled_attention_score(
+        const std::vector<float>& query, const std::vector<float>& key
+    ) {
+        const float score = dot_product(query, key);
+        const float scale = std::sqrt(static_cast<float>(query.size()));
+        return score / scale;
+    }
+
     void print_vector_preview(
         const std::string_view title, const std::vector<float>& values
     ) {
@@ -713,6 +737,17 @@ namespace {
         print_vector_preview("Query head 0", query_head);
         print_vector_preview("Key head 0", key_head);
         print_vector_preview("Value head 0", value_head);
+
+        // 9. Measure how strongly this token's query matches its own key. The
+        // square-root scaling keeps scores from growing with the head width.
+        const float attention_score = scaled_attention_score(
+            query_head, key_head
+        );
+        std::cout << "\n[Scaled attention score]\n"
+                  << "query_position: " << kInspectedPosition << '\n'
+                  << "key_position: " << kInspectedPosition << '\n'
+                  << "all_finite: " << std::isfinite(attention_score) << '\n'
+                  << "value: " << attention_score << '\n';
     }
 
 }  // namespace
