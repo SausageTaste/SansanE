@@ -111,6 +111,14 @@ namespace {
 
         size_t layer_count() const { return static_cast<size_t>(layer_count_); }
 
+        size_t vocabulary_size() const {
+            return static_cast<size_t>(vocabulary_size_);
+        }
+
+        size_t padded_vocabulary_size() const {
+            return static_cast<size_t>(padded_vocabulary_size_);
+        }
+
         std::vector<float> read_token_embedding(
             const sung::Path& checkpoint_path, const uint64_t token_id
         ) const {
@@ -121,6 +129,14 @@ namespace {
                 );
             }
             return read_tensor_row(checkpoint_path, layout_[0], token_id);
+        }
+
+        std::vector<float> read_token_embedding_table(
+            const sung::Path& checkpoint_path
+        ) const {
+            return read_tensor_elements(
+                checkpoint_path, layout_[0], 0, layout_[0].element_count
+            );
         }
 
         std::vector<float> read_position_embedding(
@@ -265,6 +281,22 @@ namespace {
         ) const {
             validate_layer_index(layer_index);
             return read_tensor_row(checkpoint_path, layout_[13], layer_index);
+        }
+
+        std::vector<float> read_final_layer_norm_weight(
+            const sung::Path& checkpoint_path
+        ) const {
+            return read_tensor_elements(
+                checkpoint_path, layout_[14], 0, layout_[14].element_count
+            );
+        }
+
+        std::vector<float> read_final_layer_norm_bias(
+            const sung::Path& checkpoint_path
+        ) const {
+            return read_tensor_elements(
+                checkpoint_path, layout_[15], 0, layout_[15].element_count
+            );
         }
 
         friend std::ostream& operator<<(
@@ -624,6 +656,30 @@ namespace {
             }
         }
         return output;
+    }
+
+    std::vector<float> linear_without_bias(
+        const std::vector<float>& input,
+        const std::vector<float>& weight,
+        const size_t output_count
+    ) {
+        return linear(input, weight, std::vector<float>(output_count, 0.0F));
+    }
+
+    size_t argmax(const std::vector<float>& values) {
+        if (values.empty()) {
+            throw std::invalid_argument(
+                "cannot find argmax of an empty vector"
+            );
+        }
+
+        size_t maximum_index = 0;
+        for (size_t index = 1; index < values.size(); ++index) {
+            if (values[index] > values[maximum_index]) {
+                maximum_index = index;
+            }
+        }
+        return maximum_index;
     }
 
     std::vector<float> gelu(const std::vector<float>& input) {
@@ -998,6 +1054,42 @@ namespace {
             std::cout << "\ntransformer_layer: " << layer << '\n';
             print_vector_preview("Transformer block output", hidden_state);
         }
+
+        // 7. Apply GPT-2's final LayerNorm after the last Transformer block.
+        // This prepares the residual stream for vocabulary projection.
+        const auto final_norm_weight = config.read_final_layer_norm_weight(
+            checkpoint_path
+        );
+        const auto final_norm_bias = config.read_final_layer_norm_bias(
+            checkpoint_path
+        );
+        const auto final_hidden_state = layer_norm(
+            hidden_state, final_norm_weight, final_norm_bias
+        );
+        print_vector_preview(
+            "Final normalized hidden state", final_hidden_state
+        );
+
+        // 8. Reuse the token-embedding table as the output matrix. Each row's
+        // dot product with the hidden state becomes that token's unscaled
+        // logit.
+        const auto token_embedding_table = config.read_token_embedding_table(
+            checkpoint_path
+        );
+        auto logits = linear_without_bias(
+            final_hidden_state,
+            token_embedding_table,
+            config.padded_vocabulary_size()
+        );
+        logits.resize(config.vocabulary_size());
+        print_vector_preview("Vocabulary logits", logits);
+
+        // 9. Greedy selection only needs the largest logit; applying softmax
+        // would change probabilities but would not change their ordering.
+        const size_t next_token_id = argmax(logits);
+        std::cout << "\n[Greedy next token]\n"
+                  << "token_id: " << next_token_id << '\n'
+                  << "logit: " << logits[next_token_id] << '\n';
     }
 
 }  // namespace
