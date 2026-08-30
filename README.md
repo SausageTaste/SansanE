@@ -52,21 +52,18 @@ cmake --build build
 Run it with the sibling-directory checkpoint path:
 
 ```bash
-./build/checkpoint_inspector ../llm.c-reference/gpt2_124M.bin
+./build/checkpoint_inspector ../llm.c-reference/gpt2_124M.bin 0 1
 ```
 
-Alternatively, provide an explicit checkpoint path:
+The arguments after the checkpoint are GPT-2 token IDs in context order. The
+inspector currently accepts token IDs directly because text tokenization is a
+separate future step. For example, a one-token context is:
 
 ```bash
-./build/checkpoint_inspector /path/to/gpt2_124M.bin
+./build/checkpoint_inspector /path/to/gpt2_124M.bin 0
 ```
 
-The inspector validates the checkpoint magic number, format version, model dimensions, attention-head divisibility, calculated parameter count, and exact file size before printing the GPT-2 configuration.
-
-To inspect the 16 parameter tensors in checkpoint order, including their shapes and byte offsets:
-
-```bash
-./build/checkpoint_inspector \
-  ../llm.c-reference/gpt2_124M.bin \
-  --list-tensors
-```
+The inspector validates the checkpoint and token sequence, prints the 16
+parameter tensors, executes an uncached causal forward pass across all supplied
+tokens, and reports vocabulary logits and the greedy next-token ID for the last
+context position.

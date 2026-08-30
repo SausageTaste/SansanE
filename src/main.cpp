@@ -1,5 +1,6 @@
 #include <array>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "auxiliary/path.hpp"
@@ -23,12 +25,6 @@ namespace {
         std::vector<uint64_t> shape;
         uint64_t element_count;
         uint64_t byte_offset;
-    };
-
-    struct QkvVectors {
-        std::vector<float> query;
-        std::vector<float> key;
-        std::vector<float> value;
     };
 
     uint64_t checked_add(const uint64_t left, const uint64_t right) {
@@ -53,6 +49,43 @@ namespace {
         }
         return product;
     }
+
+    struct ActivationMatrix {
+        size_t row_count;
+        size_t column_count;
+        std::vector<float> values;
+
+        ActivationMatrix(const size_t rows, const size_t columns)
+            : row_count{ rows }
+            , column_count{ columns }
+            , values(rows * columns) {}
+
+        float& operator()(const size_t row, const size_t column) {
+            return values[row * column_count + column];
+        }
+
+        const float& operator()(const size_t row, const size_t column) const {
+            return values[row * column_count + column];
+        }
+    };
+
+    struct QkvMatrices {
+        ActivationMatrix query;
+        ActivationMatrix key;
+        ActivationMatrix value;
+    };
+
+    struct CausalAttentionResult {
+        ActivationMatrix output;
+        std::vector<float> inspected_scores;
+        std::vector<float> inspected_probabilities;
+    };
+
+    struct TransformerBlockResult {
+        ActivationMatrix output;
+        std::vector<float> inspected_scores;
+        std::vector<float> inspected_probabilities;
+    };
 
     uint64_t positive_header_value(
         const int32_t value, const std::string_view name
@@ -117,6 +150,10 @@ namespace {
 
         size_t padded_vocabulary_size() const {
             return static_cast<size_t>(padded_vocabulary_size_);
+        }
+
+        size_t max_sequence_length() const {
+            return static_cast<size_t>(max_sequence_length_);
         }
 
         std::vector<float> read_token_embedding(
@@ -569,57 +606,62 @@ namespace {
         return header;
     }
 
-    std::vector<float> add_elementwise(
-        const std::vector<float>& left, const std::vector<float>& right
+    ActivationMatrix add_elementwise(
+        const ActivationMatrix& left, const ActivationMatrix& right
     ) {
-        if (left.size() != right.size()) {
+        if (left.row_count != right.row_count ||
+            left.column_count != right.column_count) {
             throw std::invalid_argument(
-                "cannot add vectors with different dimensions"
+                "cannot add activation matrices with different dimensions"
             );
         }
 
-        std::vector<float> result(left.size());
-        for (size_t index = 0; index < result.size(); ++index) {
-            result[index] = left[index] + right[index];
+        ActivationMatrix result(left.row_count, left.column_count);
+        for (size_t index = 0; index < result.values.size(); ++index) {
+            result.values[index] = left.values[index] + right.values[index];
         }
         return result;
     }
 
-    std::vector<float> layer_norm(
-        const std::vector<float>& input,
+    ActivationMatrix layer_norm(
+        const ActivationMatrix& input,
         const std::vector<float>& weight,
         const std::vector<float>& bias,
         const float epsilon = 1e-5F
     ) {
-        if (input.empty()) {
-            throw std::invalid_argument("cannot normalize an empty vector");
+        if (input.row_count == 0 || input.column_count == 0) {
+            throw std::invalid_argument("cannot normalize empty activations");
         }
-        if (input.size() != weight.size() || input.size() != bias.size()) {
+        if (input.column_count != weight.size() ||
+            input.column_count != bias.size()) {
             throw std::invalid_argument(
                 "LayerNorm input, weight, and bias dimensions do not match"
             );
         }
 
-        float mean = 0.0F;
-        for (const float value : input) {
-            mean += value;
-        }
-        mean /= static_cast<float>(input.size());
+        ActivationMatrix output(input.row_count, input.column_count);
+        for (size_t row = 0; row < input.row_count; ++row) {
+            float mean = 0.0F;
+            for (size_t column = 0; column < input.column_count; ++column) {
+                mean += input(row, column);
+            }
+            mean /= static_cast<float>(input.column_count);
 
-        float variance = 0.0F;
-        for (const float value : input) {
-            const float difference = value - mean;
-            variance += difference * difference;
-        }
-        variance /= static_cast<float>(input.size());
+            float variance = 0.0F;
+            for (size_t column = 0; column < input.column_count; ++column) {
+                const float difference = input(row, column) - mean;
+                variance += difference * difference;
+            }
+            variance /= static_cast<float>(input.column_count);
 
-        const float inverse_standard_deviation = 1.0F /
-                                                 std::sqrt(variance + epsilon);
-        std::vector<float> output(input.size());
-        for (size_t index = 0; index < output.size(); ++index) {
-            const float normalized = (input[index] - mean) *
-                                     inverse_standard_deviation;
-            output[index] = normalized * weight[index] + bias[index];
+            const float inverse_standard_deviation =
+                1.0F / std::sqrt(variance + epsilon);
+            for (size_t column = 0; column < input.column_count; ++column) {
+                const float normalized = (input(row, column) - mean) *
+                                         inverse_standard_deviation;
+                output(row, column) = normalized * weight[column] +
+                                      bias[column];
+            }
         }
         return output;
     }
@@ -658,6 +700,44 @@ namespace {
         return output;
     }
 
+    ActivationMatrix linear(
+        const ActivationMatrix& input,
+        const std::vector<float>& weight,
+        const std::vector<float>& bias
+    ) {
+        if (input.row_count == 0 || input.column_count == 0 || bias.empty()) {
+            throw std::invalid_argument(
+                "linear input and bias must not be empty"
+            );
+        }
+        const uint64_t expected_weight_elements = checked_multiply(
+            { static_cast<uint64_t>(bias.size()),
+              static_cast<uint64_t>(input.column_count) }
+        );
+        if (weight.size() != expected_weight_elements) {
+            throw std::invalid_argument(
+                "linear weight dimensions do not match input and bias"
+            );
+        }
+
+        ActivationMatrix output(input.row_count, bias.size());
+        for (size_t row = 0; row < input.row_count; ++row) {
+            for (size_t output_column = 0; output_column < bias.size();
+                 ++output_column) {
+                float value = bias[output_column];
+                const size_t weight_row_offset = output_column *
+                                                 input.column_count;
+                for (size_t input_column = 0; input_column < input.column_count;
+                     ++input_column) {
+                    value += weight[weight_row_offset + input_column] *
+                             input(row, input_column);
+                }
+                output(row, output_column) = value;
+            }
+        }
+        return output;
+    }
+
     std::vector<float> linear_without_bias(
         const std::vector<float>& input,
         const std::vector<float>& weight,
@@ -682,95 +762,49 @@ namespace {
         return maximum_index;
     }
 
-    std::vector<float> gelu(const std::vector<float>& input) {
+    ActivationMatrix gelu(const ActivationMatrix& input) {
         constexpr float kScalingFactor = 0.7978845608028654F;
         constexpr float kCubicCoefficient = 0.044715F;
 
-        std::vector<float> output(input.size());
-        for (size_t index = 0; index < input.size(); ++index) {
-            const float value = input[index];
+        ActivationMatrix output(input.row_count, input.column_count);
+        for (size_t index = 0; index < input.values.size(); ++index) {
+            const float value = input.values[index];
             const float cubic = value * value * value;
-            output[index] = 0.5F * value *
-                            (1.0F + std::tanh(
-                                        kScalingFactor *
-                                        (value + kCubicCoefficient * cubic)
-                                    ));
+            output.values[index] =
+                0.5F * value *
+                (1.0F + std::tanh(
+                            kScalingFactor * (value + kCubicCoefficient * cubic)
+                        ));
         }
         return output;
     }
 
-    QkvVectors split_qkv(
-        const std::vector<float>& combined, const size_t channel_count
+    QkvMatrices split_qkv(
+        const ActivationMatrix& combined, const size_t channel_count
     ) {
-        const uint64_t expected_elements = checked_multiply(
-            { 3, static_cast<uint64_t>(channel_count) }
-        );
-        if (combined.size() != expected_elements) {
+        if (combined.column_count != 3 * channel_count) {
             throw std::invalid_argument(
                 "combined QKV dimensions do not match the channel count"
             );
         }
 
-        QkvVectors output{
-            .query = std::vector<float>(channel_count),
-            .key = std::vector<float>(channel_count),
-            .value = std::vector<float>(channel_count),
+        QkvMatrices output{
+            .query = ActivationMatrix(combined.row_count, channel_count),
+            .key = ActivationMatrix(combined.row_count, channel_count),
+            .value = ActivationMatrix(combined.row_count, channel_count),
         };
-        for (size_t channel = 0; channel < channel_count; ++channel) {
-            output.query[channel] = combined[channel];
-            output.key[channel] = combined[channel_count + channel];
-            output.value[channel] = combined[2 * channel_count + channel];
+        for (size_t row = 0; row < combined.row_count; ++row) {
+            for (size_t channel = 0; channel < channel_count; ++channel) {
+                output.query(row, channel) = combined(row, channel);
+                output.key(row, channel) = combined(
+                    row, channel_count + channel
+                );
+                output.value(row, channel) = combined(
+                    row, 2 * channel_count + channel
+                );
+            }
         }
         return output;
-    }
-
-    std::vector<float> extract_attention_head(
-        const std::vector<float>& channels,
-        const size_t head_index,
-        const size_t head_count
-    ) {
-        if (head_count == 0 || channels.size() % head_count != 0) {
-            throw std::invalid_argument(
-                "channels cannot be divided evenly into attention heads"
-            );
-        }
-        if (head_index >= head_count) {
-            throw std::out_of_range(
-                "attention head index is outside the model"
-            );
-        }
-
-        const size_t channels_per_head = channels.size() / head_count;
-        const size_t head_offset = head_index * channels_per_head;
-        std::vector<float> output(channels_per_head);
-        for (size_t channel = 0; channel < channels_per_head; ++channel) {
-            output[channel] = channels[head_offset + channel];
-        }
-        return output;
-    }
-
-    float dot_product(
-        const std::vector<float>& left, const std::vector<float>& right
-    ) {
-        if (left.empty() || left.size() != right.size()) {
-            throw std::invalid_argument(
-                "dot-product vectors must have equal, nonzero dimensions"
-            );
-        }
-
-        float result = 0.0F;
-        for (size_t index = 0; index < left.size(); ++index) {
-            result += left[index] * right[index];
-        }
-        return result;
-    }
-
-    float scaled_attention_score(
-        const std::vector<float>& query, const std::vector<float>& key
-    ) {
-        const float score = dot_product(query, key);
-        const float scale = std::sqrt(static_cast<float>(query.size()));
-        return score / scale;
     }
 
     std::vector<float> softmax(const std::vector<float>& scores) {
@@ -800,89 +834,85 @@ namespace {
         return probabilities;
     }
 
-    std::vector<float> weighted_value_sum(
-        const std::vector<float>& probabilities,
-        const std::vector<float>& values,
-        const size_t channels_per_value
+    CausalAttentionResult causal_multi_head_attention(
+        const QkvMatrices& qkv, const size_t head_count
     ) {
-        if (probabilities.empty() || channels_per_value == 0) {
-            throw std::invalid_argument(
-                "attention probabilities and values must not be empty"
-            );
-        }
-        const uint64_t expected_value_elements = checked_multiply(
-            { static_cast<uint64_t>(probabilities.size()),
-              static_cast<uint64_t>(channels_per_value) }
-        );
-        if (values.size() != expected_value_elements) {
-            throw std::invalid_argument(
-                "attention value dimensions do not match probabilities"
-            );
-        }
-
-        std::vector<float> output(channels_per_value, 0.0F);
-        for (size_t value_index = 0; value_index < probabilities.size();
-             ++value_index) {
-            const size_t value_offset = value_index * channels_per_value;
-            for (size_t channel = 0; channel < channels_per_value; ++channel) {
-                output[channel] += probabilities[value_index] *
-                                   values[value_offset + channel];
-            }
-        }
-        return output;
-    }
-
-    std::vector<float> single_token_multi_head_attention(
-        const QkvVectors& qkv, const size_t head_count
-    ) {
-        if (qkv.query.empty() || qkv.query.size() != qkv.key.size() ||
-            qkv.query.size() != qkv.value.size()) {
+        if (qkv.query.row_count == 0 ||
+            qkv.query.row_count != qkv.key.row_count ||
+            qkv.query.row_count != qkv.value.row_count ||
+            qkv.query.column_count != qkv.key.column_count ||
+            qkv.query.column_count != qkv.value.column_count) {
             throw std::invalid_argument(
                 "Q, K, and V must have equal, nonzero dimensions"
             );
         }
-        if (head_count == 0 || qkv.query.size() % head_count != 0) {
+        if (head_count == 0 || qkv.query.column_count % head_count != 0) {
             throw std::invalid_argument(
                 "QKV channels cannot be divided evenly into attention heads"
             );
         }
 
-        const size_t channels_per_head = qkv.query.size() / head_count;
-        std::vector<float> output(qkv.query.size());
+        const size_t token_count = qkv.query.row_count;
+        const size_t channels_per_head = qkv.query.column_count / head_count;
+        const float score_scale = std::sqrt(
+            static_cast<float>(channels_per_head)
+        );
+        CausalAttentionResult result{
+            .output = ActivationMatrix(token_count, qkv.query.column_count),
+            .inspected_scores = {},
+            .inspected_probabilities = {},
+        };
+
         for (size_t head = 0; head < head_count; ++head) {
-            const auto query_head = extract_attention_head(
-                qkv.query, head, head_count
-            );
-            const auto key_head = extract_attention_head(
-                qkv.key, head, head_count
-            );
-            const auto value_head = extract_attention_head(
-                qkv.value, head, head_count
-            );
-
-            const std::vector<float> scores{
-                scaled_attention_score(query_head, key_head)
-            };
-            const auto probabilities = softmax(scores);
-            const auto head_output = weighted_value_sum(
-                probabilities, value_head, channels_per_head
-            );
-
             const size_t head_offset = head * channels_per_head;
-            for (size_t channel = 0; channel < channels_per_head; ++channel) {
-                output[head_offset + channel] = head_output[channel];
+            for (size_t query_position = 0; query_position < token_count;
+                 ++query_position) {
+                // Causal masking is expressed by constructing scores only for
+                // positions at or before the current query position.
+                std::vector<float> scores(query_position + 1, 0.0F);
+                for (size_t key_position = 0; key_position <= query_position;
+                     ++key_position) {
+                    for (size_t channel = 0; channel < channels_per_head;
+                         ++channel) {
+                        scores[key_position] +=
+                            qkv.query(query_position, head_offset + channel) *
+                            qkv.key(key_position, head_offset + channel);
+                    }
+                    scores[key_position] /= score_scale;
+                }
+
+                const auto probabilities = softmax(scores);
+                for (size_t channel = 0; channel < channels_per_head;
+                     ++channel) {
+                    float value = 0.0F;
+                    for (size_t key_position = 0;
+                         key_position <= query_position;
+                         ++key_position) {
+                        value += probabilities[key_position] *
+                                 qkv.value(key_position, head_offset + channel);
+                    }
+                    result.output(
+                        query_position, head_offset + channel
+                    ) = value;
+                }
+
+                if (head == 0 && query_position + 1 == token_count) {
+                    result.inspected_scores = scores;
+                    result.inspected_probabilities = probabilities;
+                }
             }
         }
-        return output;
+        return result;
     }
 
-    std::vector<float> single_token_transformer_block(
+    TransformerBlockResult transformer_block(
         const sung::Path& checkpoint_path,
         const Gpt2Config& config,
-        const std::vector<float>& input,
+        const ActivationMatrix& input,
         const size_t layer_index
     ) {
-        if (input.size() != config.channel_count()) {
+        if (input.row_count == 0 ||
+            input.column_count != config.channel_count()) {
             throw std::invalid_argument(
                 "Transformer block input does not match channel count"
             );
@@ -915,9 +945,7 @@ namespace {
 
         // 3. Run scaled dot-product attention independently in every head and
         // concatenate the head outputs back into one channel vector.
-        const auto attention = single_token_multi_head_attention(
-            qkv, config.head_count()
-        );
+        auto attention = causal_multi_head_attention(qkv, config.head_count());
 
         // 4. The attention projection mixes information across heads. The
         // first residual addition preserves the block input alongside it.
@@ -928,7 +956,7 @@ namespace {
             checkpoint_path, layer_index
         );
         const auto projected_attention = linear(
-            attention, attention_weight, attention_bias
+            attention.output, attention_weight, attention_bias
         );
         const auto post_attention = add_elementwise(input, projected_attention);
 
@@ -968,7 +996,111 @@ namespace {
 
         // 7. The second residual addition completes this Transformer block and
         // supplies the input residual stream for the following layer.
-        return add_elementwise(post_attention, projected_mlp);
+        return TransformerBlockResult{
+            .output = add_elementwise(post_attention, projected_mlp),
+            .inspected_scores = std::move(attention.inspected_scores),
+            .inspected_probabilities =
+                std::move(attention.inspected_probabilities),
+        };
+    }
+
+    std::vector<uint64_t> parse_token_ids(
+        const std::vector<std::string_view>& arguments, const Gpt2Config& config
+    ) {
+        if (arguments.empty()) {
+            throw std::invalid_argument("at least one token ID is required");
+        }
+        if (arguments.size() > config.max_sequence_length()) {
+            throw std::invalid_argument(
+                "token sequence exceeds the maximum context length"
+            );
+        }
+
+        std::vector<uint64_t> token_ids;
+        token_ids.reserve(arguments.size());
+        for (const std::string_view argument : arguments) {
+            uint64_t token_id = 0;
+            const auto [end, error] = std::from_chars(
+                argument.data(), argument.data() + argument.size(), token_id
+            );
+            if (error != std::errc{} ||
+                end != argument.data() + argument.size()) {
+                throw std::invalid_argument(
+                    "invalid token ID: " + std::string{ argument }
+                );
+            }
+            if (token_id >= config.vocabulary_size()) {
+                throw std::out_of_range(
+                    "token ID " + std::to_string(token_id) +
+                    " is outside the vocabulary"
+                );
+            }
+            token_ids.push_back(token_id);
+        }
+        return token_ids;
+    }
+
+    ActivationMatrix make_input_activations(
+        const sung::Path& checkpoint_path,
+        const Gpt2Config& config,
+        const std::vector<uint64_t>& token_ids
+    ) {
+        ActivationMatrix output(token_ids.size(), config.channel_count());
+        for (size_t position = 0; position < token_ids.size(); ++position) {
+            const auto token_embedding = config.read_token_embedding(
+                checkpoint_path, token_ids[position]
+            );
+            const auto position_embedding = config.read_position_embedding(
+                checkpoint_path, position
+            );
+            for (size_t channel = 0; channel < config.channel_count();
+                 ++channel) {
+                output(position, channel) = token_embedding[channel] +
+                                            position_embedding[channel];
+            }
+        }
+        return output;
+    }
+
+    std::vector<float> activation_row(
+        const ActivationMatrix& activations, const size_t row
+    ) {
+        if (row >= activations.row_count) {
+            throw std::out_of_range("activation row is outside the matrix");
+        }
+        std::vector<float> output(activations.column_count);
+        for (size_t column = 0; column < activations.column_count; ++column) {
+            output[column] = activations(row, column);
+        }
+        return output;
+    }
+
+    void print_activation_preview(
+        const std::string_view title, const ActivationMatrix& activations
+    ) {
+        constexpr size_t kPreviewElementCount = 8;
+        std::cout << "\n[" << title << "]\n"
+                  << "shape: " << activations.row_count << " x "
+                  << activations.column_count << '\n';
+        for (size_t row = 0; row < activations.row_count; ++row) {
+            bool all_finite = true;
+            for (size_t column = 0; column < activations.column_count;
+                 ++column) {
+                if (!std::isfinite(activations(row, column))) {
+                    all_finite = false;
+                    break;
+                }
+            }
+            std::cout << "position " << row << ": all_finite=" << std::boolalpha
+                      << all_finite << " first_values:" << std::fixed
+                      << std::setprecision(7);
+            for (size_t column = 0; column < activations.column_count &&
+                                    column < kPreviewElementCount;
+                 ++column) {
+                std::cout << ' ' << activations(row, column);
+            }
+            std::cout << '\n';
+        }
     }
 
     void print_vector_preview(
@@ -995,7 +1127,10 @@ namespace {
         std::cout << '\n';
     }
 
-    void inspect_checkpoint(const sung::Path& checkpoint_path) {
+    void inspect_checkpoint(
+        const sung::Path& checkpoint_path,
+        const std::vector<std::string_view>& token_arguments
+    ) {
         // 1. Read the fixed-size header, validate the GPT-2 format, and use
         // its model dimensions to reconstruct every parameter's file offset.
         const auto header = read_header(checkpoint_path);
@@ -1017,62 +1152,91 @@ namespace {
             );
         }
 
-        // 3. Show the validated model dimensions and parameter layout before
-        // reading individual weights.
+        // 3. Parse token IDs supplied on the command line and validate them
+        // against both the vocabulary and the maximum context length.
+        const auto token_ids = parse_token_ids(token_arguments, config);
+
+        // 4. Show the validated model dimensions, parameter layout, and input
+        // sequence before reading individual weights.
         std::cout << "checkpoint: " << checkpoint_path << '\n'
                   << "checkpoint_bytes: " << actual_file_bytes << "\n\n"
                   << config;
+        std::cout << "\ninput_token_ids:";
+        for (const uint64_t token_id : token_ids) {
+            std::cout << ' ' << token_id;
+        }
+        std::cout << '\n';
 
-        // 4. Select one token and position for this incremental inspection. A
-        // tokenizer will eventually supply token IDs for a complete sequence.
-        constexpr uint64_t kInspectedTokenId = 0;
-        constexpr uint64_t kInspectedPosition = 0;
-        std::cout << "\ninput_token_id: " << kInspectedTokenId << '\n'
-                  << "input_position: " << kInspectedPosition << '\n';
+        // 5. Add token and position embeddings for every context position,
+        // producing a contiguous [token_count, channel_count] residual stream.
+        auto hidden_states = make_input_activations(
+            checkpoint_path, config, token_ids
+        );
+        print_activation_preview("Initial hidden states", hidden_states);
 
-        // 5. Look up the token and position embeddings, then add them to form
-        // the residual-stream input to the first Transformer block.
-        const auto token_embedding = config.read_token_embedding(
-            checkpoint_path, kInspectedTokenId
-        );
-        const auto position_embedding = config.read_position_embedding(
-            checkpoint_path, kInspectedPosition
-        );
-        auto hidden_state = add_elementwise(
-            token_embedding, position_embedding
-        );
-        print_vector_preview("Token embedding", token_embedding);
-        print_vector_preview("Position embedding", position_embedding);
-        print_vector_preview("Initial hidden state", hidden_state);
-
-        // 6. Pass this single-token residual stream through every Transformer
-        // block. Each iteration selects a different layer's parameter slices.
+        // 6. Pass the entire context through every Transformer block. Each
+        // block loads its weights once and applies them to every token row.
         for (size_t layer = 0; layer < config.layer_count(); ++layer) {
-            hidden_state = single_token_transformer_block(
-                checkpoint_path, config, hidden_state, layer
+            auto block = transformer_block(
+                checkpoint_path, config, hidden_states, layer
             );
+
+            // One detailed row makes the causal rule visible without dumping
+            // every head and every query position from all twelve layers.
+            if (layer == 0) {
+                float probability_sum = 0.0F;
+                for (const float probability : block.inspected_probabilities) {
+                    probability_sum += probability;
+                }
+                std::cout << "\n[Causal attention diagnostic]\n"
+                          << "layer: 0\n"
+                          << "head: 0\n"
+                          << "query_position: " << token_ids.size() - 1 << '\n'
+                          << "allowed_key_positions:";
+                for (size_t position = 0; position < token_ids.size();
+                     ++position) {
+                    std::cout << ' ' << position;
+                }
+                std::cout << "\ncausal_key_counts_by_query:";
+                for (size_t position = 0; position < token_ids.size();
+                     ++position) {
+                    std::cout << ' ' << position + 1;
+                }
+                std::cout << '\n';
+                print_vector_preview(
+                    "Scaled attention scores", block.inspected_scores
+                );
+                print_vector_preview(
+                    "Attention probabilities", block.inspected_probabilities
+                );
+                std::cout << "probability_sum: " << probability_sum << '\n';
+            }
+
+            hidden_states = std::move(block.output);
             std::cout << "\ntransformer_layer: " << layer << '\n';
-            print_vector_preview("Transformer block output", hidden_state);
+            print_activation_preview("Transformer block output", hidden_states);
         }
 
         // 7. Apply GPT-2's final LayerNorm after the last Transformer block.
-        // This prepares the residual stream for vocabulary projection.
+        // Every position is normalized, preserving a complete forward result.
         const auto final_norm_weight = config.read_final_layer_norm_weight(
             checkpoint_path
         );
         const auto final_norm_bias = config.read_final_layer_norm_bias(
             checkpoint_path
         );
-        const auto final_hidden_state = layer_norm(
-            hidden_state, final_norm_weight, final_norm_bias
+        const auto final_hidden_states = layer_norm(
+            hidden_states, final_norm_weight, final_norm_bias
         );
-        print_vector_preview(
-            "Final normalized hidden state", final_hidden_state
+        print_activation_preview(
+            "Final normalized hidden states", final_hidden_states
         );
 
         // 8. Reuse the token-embedding table as the output matrix. Each row's
-        // dot product with the hidden state becomes that token's unscaled
-        // logit.
+        // dot product with the final position becomes that token's logit.
+        const auto final_hidden_state = activation_row(
+            final_hidden_states, final_hidden_states.row_count - 1
+        );
         const auto token_embedding_table = config.read_token_embedding_table(
             checkpoint_path
         );
@@ -1096,11 +1260,18 @@ namespace {
 
 
 int main(const int argc, char* argv[]) {
-    if (argc < 2)
-        return -1;
+    if (argc < 3) {
+        std::cerr << "usage: checkpoint_inspector <checkpoint> <token_id>...\n";
+        return 1;
+    }
 
     try {
-        inspect_checkpoint(argv[1]);
+        std::vector<std::string_view> token_arguments;
+        token_arguments.reserve(static_cast<size_t>(argc - 2));
+        for (int index = 2; index < argc; ++index) {
+            token_arguments.emplace_back(argv[index]);
+        }
+        inspect_checkpoint(argv[1], token_arguments);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;
