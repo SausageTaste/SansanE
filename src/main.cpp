@@ -179,6 +179,28 @@ namespace {
             );
         }
 
+        std::vector<float> read_attention_projection_weight(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            const uint64_t elements_per_layer = checked_multiply(
+                { channel_count_, channel_count_ }
+            );
+            return read_tensor_elements(
+                checkpoint_path,
+                layout_[6],
+                checked_multiply({ layer_index, elements_per_layer }),
+                elements_per_layer
+            );
+        }
+
+        std::vector<float> read_attention_projection_bias(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            return read_tensor_row(checkpoint_path, layout_[7], layer_index);
+        }
+
         friend std::ostream& operator<<(
             std::ostream& os, const Gpt2Config& config
         );
@@ -672,6 +694,50 @@ namespace {
         return output;
     }
 
+    std::vector<float> single_token_multi_head_attention(
+        const QkvVectors& qkv, const size_t head_count
+    ) {
+        if (qkv.query.empty() || qkv.query.size() != qkv.key.size() ||
+            qkv.query.size() != qkv.value.size()) {
+            throw std::invalid_argument(
+                "Q, K, and V must have equal, nonzero dimensions"
+            );
+        }
+        if (head_count == 0 || qkv.query.size() % head_count != 0) {
+            throw std::invalid_argument(
+                "QKV channels cannot be divided evenly into attention heads"
+            );
+        }
+
+        const size_t channels_per_head = qkv.query.size() / head_count;
+        std::vector<float> output(qkv.query.size());
+        for (size_t head = 0; head < head_count; ++head) {
+            const auto query_head = extract_attention_head(
+                qkv.query, head, head_count
+            );
+            const auto key_head = extract_attention_head(
+                qkv.key, head, head_count
+            );
+            const auto value_head = extract_attention_head(
+                qkv.value, head, head_count
+            );
+
+            const std::vector<float> scores{
+                scaled_attention_score(query_head, key_head)
+            };
+            const auto probabilities = softmax(scores);
+            const auto head_output = weighted_value_sum(
+                probabilities, value_head, channels_per_head
+            );
+
+            const size_t head_offset = head * channels_per_head;
+            for (size_t channel = 0; channel < channels_per_head; ++channel) {
+                output[head_offset + channel] = head_output[channel];
+            }
+        }
+        return output;
+    }
+
     void print_vector_preview(
         const std::string_view title, const std::vector<float>& values
     ) {
@@ -817,6 +883,40 @@ namespace {
             "Attention probabilities", attention_probabilities
         );
         print_vector_preview("Attention head output", attention_output);
+
+        // 11. Repeat the same attention calculation independently for every
+        // head, then concatenate the 12 outputs back into 768 channels.
+        const auto multi_head_attention_output =
+            single_token_multi_head_attention(split, config.head_count());
+        print_vector_preview(
+            "Concatenated attention heads", multi_head_attention_output
+        );
+
+        // 12. Mix information from all heads with the learned attention output
+        // projection, returning from 768 concatenated channels to 768 channels.
+        const auto attention_projection_weight =
+            config.read_attention_projection_weight(
+                checkpoint_path, kInspectedLayer
+            );
+        const auto attention_projection_bias =
+            config.read_attention_projection_bias(
+                checkpoint_path, kInspectedLayer
+            );
+        const auto projected_attention = linear(
+            multi_head_attention_output,
+            attention_projection_weight,
+            attention_projection_bias
+        );
+        print_vector_preview("Projected attention", projected_attention);
+
+        // 13. Preserve the block input through a residual connection. This
+        // sum becomes the residual stream consumed by the block's second norm.
+        const auto post_attention_hidden_state = add_elementwise(
+            hidden_state, projected_attention
+        );
+        print_vector_preview(
+            "Post-attention hidden state", post_attention_hidden_state
+        );
     }
 
 }  // namespace
