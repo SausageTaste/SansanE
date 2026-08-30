@@ -135,6 +135,36 @@ namespace {
             return read_tensor_row(checkpoint_path, layout_[3], layer_index);
         }
 
+        std::vector<float> read_qkv_projection_weight(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            const uint64_t elements_per_layer = checked_multiply(
+                { 3, channel_count_, channel_count_ }
+            );
+            return read_tensor_elements(
+                checkpoint_path,
+                layout_[4],
+                checked_multiply({ layer_index, elements_per_layer }),
+                elements_per_layer
+            );
+        }
+
+        std::vector<float> read_qkv_projection_bias(
+            const sung::Path& checkpoint_path, const uint64_t layer_index
+        ) const {
+            validate_layer_index(layer_index);
+            const uint64_t elements_per_layer = checked_multiply(
+                { 3, channel_count_ }
+            );
+            return read_tensor_elements(
+                checkpoint_path,
+                layout_[5],
+                checked_multiply({ layer_index, elements_per_layer }),
+                elements_per_layer
+            );
+        }
+
         friend std::ostream& operator<<(
             std::ostream& os, const Gpt2Config& config
         );
@@ -165,22 +195,52 @@ namespace {
                 );
             }
 
-            const uint64_t row_bytes = checked_multiply(
-                { channel_count_, Gpt2Config::kParameterBytes }
+            const uint64_t row_elements = tensor.shape[1];
+            return read_tensor_elements(
+                checkpoint_path,
+                tensor,
+                checked_multiply({ row_index, row_elements }),
+                row_elements
             );
-            const uint64_t row_offset = checked_add(
-                tensor.byte_offset, checked_multiply({ row_index, row_bytes })
+        }
+
+        std::vector<float> read_tensor_elements(
+            const sung::Path& checkpoint_path,
+            const ParameterTensor& tensor,
+            const uint64_t element_offset,
+            const uint64_t element_count
+        ) const {
+            const uint64_t element_end = checked_add(
+                element_offset, element_count
+            );
+            if (element_end > tensor.element_count) {
+                throw std::out_of_range(
+                    "element range is outside tensor " +
+                    std::string{ tensor.name }
+                );
+            }
+
+            const uint64_t bytes_to_read = checked_multiply(
+                { element_count, Gpt2Config::kParameterBytes }
+            );
+            const uint64_t byte_offset = checked_add(
+                tensor.byte_offset,
+                checked_multiply(
+                    { element_offset, Gpt2Config::kParameterBytes }
+                )
             );
 
-            if (channel_count_ > std::numeric_limits<size_t>::max() ||
-                row_bytes > static_cast<uint64_t>(
-                                std::numeric_limits<std::streamsize>::max()
-                            ) ||
-                row_offset > static_cast<uint64_t>(
-                                 std::numeric_limits<std::streamoff>::max()
-                             )) {
+            if (element_count > std::numeric_limits<size_t>::max() ||
+                bytes_to_read >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<std::streamsize>::max()
+                    ) ||
+                byte_offset >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<std::streamoff>::max()
+                    )) {
                 throw std::overflow_error(
-                    "row from tensor " + std::string{ tensor.name } +
+                    "range from tensor " + std::string{ tensor.name } +
                     " is too large to read"
                 );
             }
@@ -192,22 +252,27 @@ namespace {
                 );
             }
 
-            checkpoint.seekg(static_cast<std::streamoff>(row_offset));
+            checkpoint.seekg(static_cast<std::streamoff>(byte_offset));
             if (!checkpoint) {
                 throw std::runtime_error(
                     "cannot seek to tensor " + std::string{ tensor.name }
                 );
             }
 
-            std::vector<float> row(static_cast<size_t>(channel_count_));
-            const auto bytes_to_read = static_cast<std::streamsize>(row_bytes);
-            checkpoint.read(reinterpret_cast<char*>(row.data()), bytes_to_read);
-            if (checkpoint.gcount() != bytes_to_read) {
+            std::vector<float> elements(static_cast<size_t>(element_count));
+            const auto stream_size = static_cast<std::streamsize>(
+                bytes_to_read
+            );
+            checkpoint.read(
+                reinterpret_cast<char*>(elements.data()), stream_size
+            );
+            if (checkpoint.gcount() != stream_size) {
                 throw std::runtime_error(
-                    "incomplete row from tensor " + std::string{ tensor.name }
+                    "incomplete range from tensor " +
+                    std::string{ tensor.name }
                 );
             }
-            return row;
+            return elements;
         }
 
         void parse(const HeaderBuffer& header) {
@@ -428,6 +493,40 @@ namespace {
         return output;
     }
 
+    std::vector<float> linear(
+        const std::vector<float>& input,
+        const std::vector<float>& weight,
+        const std::vector<float>& bias
+    ) {
+        if (input.empty() || bias.empty()) {
+            throw std::invalid_argument(
+                "linear input and bias must not be empty"
+            );
+        }
+        const uint64_t expected_weight_elements = checked_multiply(
+            { static_cast<uint64_t>(bias.size()),
+              static_cast<uint64_t>(input.size()) }
+        );
+        if (weight.size() != expected_weight_elements) {
+            throw std::invalid_argument(
+                "linear weight dimensions do not match input and bias"
+            );
+        }
+
+        std::vector<float> output = bias;
+        for (size_t output_index = 0; output_index < output.size();
+             ++output_index) {
+            const size_t weight_row_offset = output_index * input.size();
+            for (size_t input_index = 0; input_index < input.size();
+                 ++input_index) {
+                output[output_index] +=
+                    weight[weight_row_offset + input_index] *
+                    input[input_index];
+            }
+        }
+        return output;
+    }
+
     void print_vector_preview(
         const std::string_view title, const std::vector<float>& values
     ) {
@@ -495,6 +594,15 @@ namespace {
         const auto normalized_hidden_state = layer_norm(
             hidden_state, layer_norm_weight, layer_norm_bias
         );
+        const auto qkv_weight = config.read_qkv_projection_weight(
+            checkpoint_path, kInspectedLayer
+        );
+        const auto qkv_bias = config.read_qkv_projection_bias(
+            checkpoint_path, kInspectedLayer
+        );
+        const auto qkv = linear(
+            normalized_hidden_state, qkv_weight, qkv_bias
+        );
 
         std::cout << "\ninput_token_id: " << kInspectedTokenId << '\n'
                   << "input_position: " << kInspectedPosition << '\n'
@@ -507,6 +615,7 @@ namespace {
         print_vector_preview(
             "Normalized hidden state", normalized_hidden_state
         );
+        print_vector_preview("Combined QKV projection", qkv);
     }
 
 }  // namespace
