@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "auxiliary/path.hpp"
+#include "tokenizer.hpp"
 
 
 namespace {
@@ -85,6 +87,14 @@ namespace {
         ActivationMatrix output;
         std::vector<float> inspected_scores;
         std::vector<float> inspected_probabilities;
+    };
+
+    struct ProgramOptions {
+        sung::Path checkpoint_path;
+        std::optional<sung::Path> tokenizer_path;
+        std::optional<std::string> prompt;
+        std::vector<std::string_view> token_arguments;
+        size_t generation_count = 0;
     };
 
     uint64_t positive_header_value(
@@ -1142,6 +1152,99 @@ namespace {
         return generation_count;
     }
 
+    ProgramOptions parse_program_options(const int argc, char* argv[]) {
+        if (argc < 3) {
+            throw std::invalid_argument(
+                "usage: checkpoint_inspector <checkpoint> "
+                "[--generate <count>] <token_id>...\n"
+                "   or: checkpoint_inspector <checkpoint> "
+                "--tokenizer <tokenizer.bin> [--generate <count>] "
+                "--prompt <text>"
+            );
+        }
+
+        ProgramOptions options{ .checkpoint_path = argv[1] };
+        bool generation_count_was_set = false;
+        for (int index = 2; index < argc; ++index) {
+            const std::string_view argument = argv[index];
+            if (argument == "--generate") {
+                if (generation_count_was_set) {
+                    throw std::invalid_argument(
+                        "--generate may only be specified once"
+                    );
+                }
+                if (index + 1 >= argc) {
+                    throw std::invalid_argument("--generate requires a count");
+                }
+                options.generation_count = parse_generation_count(
+                    argv[++index]
+                );
+                generation_count_was_set = true;
+                continue;
+            }
+            if (argument == "--tokenizer") {
+                if (options.tokenizer_path.has_value()) {
+                    throw std::invalid_argument(
+                        "--tokenizer may only be specified once"
+                    );
+                }
+                if (index + 1 >= argc) {
+                    throw std::invalid_argument(
+                        "--tokenizer requires a file path"
+                    );
+                }
+                options.tokenizer_path = argv[++index];
+                continue;
+            }
+            if (argument == "--prompt") {
+                if (options.prompt.has_value()) {
+                    throw std::invalid_argument(
+                        "--prompt may only be specified once"
+                    );
+                }
+                if (index + 1 >= argc) {
+                    throw std::invalid_argument("--prompt requires text");
+                }
+                options.prompt = argv[++index];
+                continue;
+            }
+            if (argument.starts_with("--")) {
+                throw std::invalid_argument(
+                    "unknown option: " + std::string{ argument }
+                );
+            }
+            options.token_arguments.push_back(argument);
+        }
+
+        if (options.prompt.has_value()) {
+            if (!options.tokenizer_path.has_value()) {
+                throw std::invalid_argument(
+                    "--prompt requires --tokenizer <tokenizer.bin>"
+                );
+            }
+            if (!options.token_arguments.empty()) {
+                throw std::invalid_argument(
+                    "a text prompt cannot be combined with numeric token IDs"
+                );
+            }
+            if (options.prompt->empty()) {
+                throw std::invalid_argument("the text prompt cannot be empty");
+            }
+        } else {
+            if (options.tokenizer_path.has_value()) {
+                throw std::invalid_argument(
+                    "--tokenizer requires --prompt <text>"
+                );
+            }
+            if (options.token_arguments.empty()) {
+                throw std::invalid_argument(
+                    "at least one token ID or a text prompt is required"
+                );
+            }
+        }
+        return options;
+    }
+
     size_t run_forward_pass(
         const sung::Path& checkpoint_path,
         const Gpt2Config& config,
@@ -1237,21 +1340,17 @@ namespace {
         return next_token_id;
     }
 
-    void inspect_checkpoint(
-        const sung::Path& checkpoint_path,
-        const std::vector<std::string_view>& token_arguments,
-        const size_t generation_count
-    ) {
+    void inspect_checkpoint(const ProgramOptions& options) {
         // 1. Read the fixed-size header, validate the GPT-2 format, and use
         // its model dimensions to reconstruct every parameter's file offset.
-        const auto header = read_header(checkpoint_path);
+        const auto header = read_header(options.checkpoint_path);
         const auto config = Gpt2Config::create(header);
 
         // 2. Verify that the reconstructed parameter layout accounts for the
         // entire file, catching truncated or incompatible checkpoints.
         const uint64_t expected_file_bytes = config.expected_file_bytes();
         const uint64_t actual_file_bytes = std::filesystem::file_size(
-            checkpoint_path
+            options.checkpoint_path
         );
         if (actual_file_bytes != expected_file_bytes) {
             throw std::runtime_error(
@@ -1263,10 +1362,32 @@ namespace {
             );
         }
 
-        // 3. Parse token IDs supplied on the command line and validate them
-        // against both the vocabulary and the maximum context length.
-        auto token_ids = parse_token_ids(token_arguments, config);
-        if (generation_count >
+        // 3. Convert a text prompt with the supplied tokenizer, or parse the
+        // numeric token IDs directly. Both modes produce the same model input.
+        std::optional<sung::Gpt2Tokenizer> tokenizer;
+        std::vector<uint64_t> token_ids;
+        if (options.prompt.has_value()) {
+            tokenizer.emplace(*options.tokenizer_path);
+            if (tokenizer->vocabulary_size() != config.vocabulary_size()) {
+                throw std::runtime_error(
+                    "tokenizer vocabulary size does not match the checkpoint"
+                );
+            }
+            token_ids = tokenizer->encode(*options.prompt);
+            if (token_ids.empty()) {
+                throw std::invalid_argument(
+                    "the text prompt must encode to at least one token"
+                );
+            }
+        } else {
+            token_ids = parse_token_ids(options.token_arguments, config);
+        }
+        if (token_ids.size() > config.max_sequence_length()) {
+            throw std::invalid_argument(
+                "token sequence exceeds the maximum context length"
+            );
+        }
+        if (options.generation_count >
             config.max_sequence_length() - token_ids.size()) {
             throw std::invalid_argument(
                 "requested generation would exceed the maximum context length"
@@ -1275,17 +1396,27 @@ namespace {
 
         // 4. Show the validated model dimensions, parameter layout, and input
         // sequence before reading individual weights.
-        std::cout << "checkpoint: " << checkpoint_path << '\n'
+        std::cout << "checkpoint: " << options.checkpoint_path << '\n'
                   << "checkpoint_bytes: " << actual_file_bytes << "\n\n"
                   << config;
+        if (options.prompt.has_value()) {
+            std::cout << "\ninput_text: " << *options.prompt << '\n';
+        }
         std::cout << "\ninput_token_ids:";
         for (const uint64_t token_id : token_ids) {
             std::cout << ' ' << token_id;
         }
         std::cout << '\n';
 
-        if (generation_count == 0) {
-            run_forward_pass(checkpoint_path, config, token_ids);
+        if (options.generation_count == 0) {
+            const size_t next_token_id = run_forward_pass(
+                options.checkpoint_path, config, token_ids
+            );
+            if (tokenizer.has_value()) {
+                const std::array<uint64_t, 1> next_token{ next_token_id };
+                std::cout << "next_token_text: "
+                          << tokenizer->decode(next_token) << '\n';
+            }
             return;
         }
 
@@ -1294,8 +1425,8 @@ namespace {
         // step. This intentionally has no KV cache, keeping the data flow
         // straightforward while making the repeated work visible.
         std::vector<uint64_t> generated_token_ids;
-        generated_token_ids.reserve(generation_count);
-        for (size_t step = 0; step < generation_count; ++step) {
+        generated_token_ids.reserve(options.generation_count);
+        for (size_t step = 0; step < options.generation_count; ++step) {
             std::cout << "\n[Generation step]\n"
                       << "step: " << step + 1 << '\n'
                       << "context_token_ids:";
@@ -1305,7 +1436,7 @@ namespace {
             std::cout << '\n';
 
             const size_t next_token_id = run_forward_pass(
-                checkpoint_path, config, token_ids
+                options.checkpoint_path, config, token_ids
             );
             token_ids.push_back(next_token_id);
             generated_token_ids.push_back(next_token_id);
@@ -1321,39 +1452,20 @@ namespace {
             std::cout << ' ' << token_id;
         }
         std::cout << '\n';
+        if (tokenizer.has_value()) {
+            std::cout << "generated_text: "
+                      << tokenizer->decode(generated_token_ids) << '\n'
+                      << "complete_text: " << tokenizer->decode(token_ids)
+                      << '\n';
+        }
     }
 
 }  // namespace
 
 
 int main(const int argc, char* argv[]) {
-    if (argc < 3) {
-        std::cerr << "usage: checkpoint_inspector <checkpoint> "
-                     "[--generate <count>] <token_id>...\n";
-        return 1;
-    }
-
     try {
-        size_t generation_count = 0;
-        int first_token_argument = 2;
-        if (std::string_view{ argv[2] } == "--generate") {
-            if (argc < 5) {
-                throw std::invalid_argument(
-                    "--generate requires a count and at least one token ID"
-                );
-            }
-            generation_count = parse_generation_count(argv[3]);
-            first_token_argument = 4;
-        }
-
-        std::vector<std::string_view> token_arguments;
-        token_arguments.reserve(
-            static_cast<size_t>(argc - first_token_argument)
-        );
-        for (int index = first_token_argument; index < argc; ++index) {
-            token_arguments.emplace_back(argv[index]);
-        }
-        inspect_checkpoint(argv[1], token_arguments, generation_count);
+        inspect_checkpoint(parse_program_options(argc, argv));
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;

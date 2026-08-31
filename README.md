@@ -1,6 +1,6 @@
 # SansanE
 
-SansanE is a learning project for implementing decoder-only Transformer inference from scratch in C++. The first target is GPT-2 124M, using a simple FP32 CPU implementation for correctness before adding tokenization, KV caching, Vulkan compute, and optimization.
+SansanE is a learning project for implementing decoder-only Transformer inference from scratch in C++. The first target is GPT-2 124M, using a simple FP32 CPU implementation for correctness before adding KV caching, Vulkan compute, and optimization.
 
 See [LLM_INFERENCE_LEARNING_PATH.md](LLM_INFERENCE_LEARNING_PATH.md) for the complete roadmap.
 
@@ -49,15 +49,39 @@ cmake -S . -B build
 cmake --build build
 ```
 
-Run it with the sibling-directory checkpoint path:
+Run it with the sibling-directory checkpoint and tokenizer paths plus a quoted
+ASCII prompt:
+
+```bash
+./build/checkpoint_inspector \
+  ../llm.c-reference/gpt2_124M.bin \
+  --tokenizer ../llm.c-reference/gpt2_tokenizer.bin \
+  --prompt "Hello, world!"
+```
+
+Generate multiple tokens by adding `--generate`:
+
+```bash
+./build/checkpoint_inspector \
+  ../llm.c-reference/gpt2_124M.bin \
+  --tokenizer ../llm.c-reference/gpt2_tokenizer.bin \
+  --generate 3 \
+  --prompt "Hello"
+```
+
+The tokenizer implements GPT-2's pre-tokenization and BPE rules for ASCII
+input without external dependencies. Unicode prompts are rejected explicitly
+for now. Token IDs are decoded as raw GPT-2 token bytes, so generated and
+complete text can be printed after inference.
+
+The original numeric-token interface remains available:
 
 ```bash
 ./build/checkpoint_inspector ../llm.c-reference/gpt2_124M.bin 0 1
 ```
 
-The arguments after the checkpoint are GPT-2 token IDs in context order. The
-inspector currently accepts token IDs directly because text tokenization is a
-separate future step. For example, a one-token context is:
+The positional arguments after the checkpoint are GPT-2 token IDs in context
+order. For example, a one-token context is:
 
 ```bash
 ./build/checkpoint_inspector /path/to/gpt2_124M.bin 0
@@ -68,8 +92,7 @@ parameter tensors, executes an uncached causal forward pass across all supplied
 tokens, and reports vocabulary logits and the greedy next-token ID for the last
 context position.
 
-To generate several token IDs autoregressively, pass `--generate` followed by
-the number of new tokens:
+Numeric mode also supports autoregressive generation:
 
 ```bash
 ./build/checkpoint_inspector ../llm.c-reference/gpt2_124M.bin --generate 3 0 1
