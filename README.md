@@ -67,3 +67,14 @@ The inspector validates the checkpoint and token sequence, prints the 16
 parameter tensors, executes an uncached causal forward pass across all supplied
 tokens, and reports vocabulary logits and the greedy next-token ID for the last
 context position.
+
+To generate several token IDs autoregressively, pass `--generate` followed by
+the number of new tokens:
+
+```bash
+./build/checkpoint_inspector ../llm.c-reference/gpt2_124M.bin --generate 3 0 1
+```
+
+At each generation step, the inspector selects the highest-logit token, appends
+it to the context, and recomputes the complete prefix. This deliberately simple
+implementation does not use a KV cache yet.

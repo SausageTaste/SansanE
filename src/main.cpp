@@ -1127,54 +1127,34 @@ namespace {
         std::cout << '\n';
     }
 
-    void inspect_checkpoint(
-        const sung::Path& checkpoint_path,
-        const std::vector<std::string_view>& token_arguments
-    ) {
-        // 1. Read the fixed-size header, validate the GPT-2 format, and use
-        // its model dimensions to reconstruct every parameter's file offset.
-        const auto header = read_header(checkpoint_path);
-        const auto config = Gpt2Config::create(header);
-
-        // 2. Verify that the reconstructed parameter layout accounts for the
-        // entire file, catching truncated or incompatible checkpoints.
-        const uint64_t expected_file_bytes = config.expected_file_bytes();
-        const uint64_t actual_file_bytes = std::filesystem::file_size(
-            checkpoint_path
+    size_t parse_generation_count(const std::string_view argument) {
+        size_t generation_count = 0;
+        const auto [end, error] = std::from_chars(
+            argument.data(), argument.data() + argument.size(), generation_count
         );
-        if (actual_file_bytes != expected_file_bytes) {
-            throw std::runtime_error(
-                std::format(
-                    "checkpoint size mismatch: expected {} bytes, got {}",
-                    expected_file_bytes,
-                    actual_file_bytes
-                )
+        if (error != std::errc{} || end != argument.data() + argument.size() ||
+            generation_count == 0) {
+            throw std::invalid_argument(
+                "generation count must be a positive integer: " +
+                std::string{ argument }
             );
         }
+        return generation_count;
+    }
 
-        // 3. Parse token IDs supplied on the command line and validate them
-        // against both the vocabulary and the maximum context length.
-        const auto token_ids = parse_token_ids(token_arguments, config);
-
-        // 4. Show the validated model dimensions, parameter layout, and input
-        // sequence before reading individual weights.
-        std::cout << "checkpoint: " << checkpoint_path << '\n'
-                  << "checkpoint_bytes: " << actual_file_bytes << "\n\n"
-                  << config;
-        std::cout << "\ninput_token_ids:";
-        for (const uint64_t token_id : token_ids) {
-            std::cout << ' ' << token_id;
-        }
-        std::cout << '\n';
-
-        // 5. Add token and position embeddings for every context position,
+    size_t run_forward_pass(
+        const sung::Path& checkpoint_path,
+        const Gpt2Config& config,
+        const std::vector<uint64_t>& token_ids
+    ) {
+        // 1. Add token and position embeddings for every context position,
         // producing a contiguous [token_count, channel_count] residual stream.
         auto hidden_states = make_input_activations(
             checkpoint_path, config, token_ids
         );
         print_activation_preview("Initial hidden states", hidden_states);
 
-        // 6. Pass the entire context through every Transformer block. Each
+        // 2. Pass the entire context through every Transformer block. Each
         // block loads its weights once and applies them to every token row.
         for (size_t layer = 0; layer < config.layer_count(); ++layer) {
             auto block = transformer_block(
@@ -1217,7 +1197,7 @@ namespace {
             print_activation_preview("Transformer block output", hidden_states);
         }
 
-        // 7. Apply GPT-2's final LayerNorm after the last Transformer block.
+        // 3. Apply GPT-2's final LayerNorm after the last Transformer block.
         // Every position is normalized, preserving a complete forward result.
         const auto final_norm_weight = config.read_final_layer_norm_weight(
             checkpoint_path
@@ -1232,7 +1212,7 @@ namespace {
             "Final normalized hidden states", final_hidden_states
         );
 
-        // 8. Reuse the token-embedding table as the output matrix. Each row's
+        // 4. Reuse the token-embedding table as the output matrix. Each row's
         // dot product with the final position becomes that token's logit.
         const auto final_hidden_state = activation_row(
             final_hidden_states, final_hidden_states.row_count - 1
@@ -1248,12 +1228,99 @@ namespace {
         logits.resize(config.vocabulary_size());
         print_vector_preview("Vocabulary logits", logits);
 
-        // 9. Greedy selection only needs the largest logit; applying softmax
+        // 5. Greedy selection only needs the largest logit; applying softmax
         // would change probabilities but would not change their ordering.
         const size_t next_token_id = argmax(logits);
         std::cout << "\n[Greedy next token]\n"
                   << "token_id: " << next_token_id << '\n'
                   << "logit: " << logits[next_token_id] << '\n';
+        return next_token_id;
+    }
+
+    void inspect_checkpoint(
+        const sung::Path& checkpoint_path,
+        const std::vector<std::string_view>& token_arguments,
+        const size_t generation_count
+    ) {
+        // 1. Read the fixed-size header, validate the GPT-2 format, and use
+        // its model dimensions to reconstruct every parameter's file offset.
+        const auto header = read_header(checkpoint_path);
+        const auto config = Gpt2Config::create(header);
+
+        // 2. Verify that the reconstructed parameter layout accounts for the
+        // entire file, catching truncated or incompatible checkpoints.
+        const uint64_t expected_file_bytes = config.expected_file_bytes();
+        const uint64_t actual_file_bytes = std::filesystem::file_size(
+            checkpoint_path
+        );
+        if (actual_file_bytes != expected_file_bytes) {
+            throw std::runtime_error(
+                std::format(
+                    "checkpoint size mismatch: expected {} bytes, got {}",
+                    expected_file_bytes,
+                    actual_file_bytes
+                )
+            );
+        }
+
+        // 3. Parse token IDs supplied on the command line and validate them
+        // against both the vocabulary and the maximum context length.
+        auto token_ids = parse_token_ids(token_arguments, config);
+        if (generation_count >
+            config.max_sequence_length() - token_ids.size()) {
+            throw std::invalid_argument(
+                "requested generation would exceed the maximum context length"
+            );
+        }
+
+        // 4. Show the validated model dimensions, parameter layout, and input
+        // sequence before reading individual weights.
+        std::cout << "checkpoint: " << checkpoint_path << '\n'
+                  << "checkpoint_bytes: " << actual_file_bytes << "\n\n"
+                  << config;
+        std::cout << "\ninput_token_ids:";
+        for (const uint64_t token_id : token_ids) {
+            std::cout << ' ' << token_id;
+        }
+        std::cout << '\n';
+
+        if (generation_count == 0) {
+            run_forward_pass(checkpoint_path, config, token_ids);
+            return;
+        }
+
+        // 5. Autoregressive generation repeats the complete forward pass.
+        // Each predicted token is appended to the context before the next
+        // step. This intentionally has no KV cache, keeping the data flow
+        // straightforward while making the repeated work visible.
+        std::vector<uint64_t> generated_token_ids;
+        generated_token_ids.reserve(generation_count);
+        for (size_t step = 0; step < generation_count; ++step) {
+            std::cout << "\n[Generation step]\n"
+                      << "step: " << step + 1 << '\n'
+                      << "context_token_ids:";
+            for (const uint64_t token_id : token_ids) {
+                std::cout << ' ' << token_id;
+            }
+            std::cout << '\n';
+
+            const size_t next_token_id = run_forward_pass(
+                checkpoint_path, config, token_ids
+            );
+            token_ids.push_back(next_token_id);
+            generated_token_ids.push_back(next_token_id);
+        }
+
+        std::cout << "\n[Generation result]\n"
+                  << "generated_token_ids:";
+        for (const uint64_t token_id : generated_token_ids) {
+            std::cout << ' ' << token_id;
+        }
+        std::cout << "\ncomplete_token_ids:";
+        for (const uint64_t token_id : token_ids) {
+            std::cout << ' ' << token_id;
+        }
+        std::cout << '\n';
     }
 
 }  // namespace
@@ -1261,17 +1328,32 @@ namespace {
 
 int main(const int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "usage: checkpoint_inspector <checkpoint> <token_id>...\n";
+        std::cerr << "usage: checkpoint_inspector <checkpoint> "
+                     "[--generate <count>] <token_id>...\n";
         return 1;
     }
 
     try {
+        size_t generation_count = 0;
+        int first_token_argument = 2;
+        if (std::string_view{ argv[2] } == "--generate") {
+            if (argc < 5) {
+                throw std::invalid_argument(
+                    "--generate requires a count and at least one token ID"
+                );
+            }
+            generation_count = parse_generation_count(argv[3]);
+            first_token_argument = 4;
+        }
+
         std::vector<std::string_view> token_arguments;
-        token_arguments.reserve(static_cast<size_t>(argc - 2));
-        for (int index = 2; index < argc; ++index) {
+        token_arguments.reserve(
+            static_cast<size_t>(argc - first_token_argument)
+        );
+        for (int index = first_token_argument; index < argc; ++index) {
             token_arguments.emplace_back(argv[index]);
         }
-        inspect_checkpoint(argv[1], token_arguments);
+        inspect_checkpoint(argv[1], token_arguments, generation_count);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;
