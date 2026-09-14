@@ -101,3 +101,27 @@ Numeric mode also supports autoregressive generation:
 At each generation step, the inspector selects the highest-logit token, appends
 it to the context, and recomputes the complete prefix. This deliberately simple
 implementation does not use a KV cache yet.
+
+Greedy generation can repeat. For example, with the starter-pack checkpoint,
+`--generate 20 --prompt "Good lord"` produces `Good lord, I'm sorry. I'm sorry.
+I'm sorry. I'm sorry. I'm sorry`. All 20 greedy choices match the local `llm.c`
+FP32 CPU reference. This repetition alone does not indicate an inference bug.
+Temperature and random sampling are not implemented yet.
+
+## Run Tests
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+The tests cover tokenization and the reference-checked generation example above.
+Tests that require the sibling-directory model or tokenizer artifacts are skipped
+when those files are unavailable. Run the tests in a Release build as well when
+changing checkpoint loading or inference code.
+
+The generation regression checks token IDs and finite outputs; it is not a
+numerical parity suite. A one-time comparison of the example's 21 input positions
+against `llm.c` commit `f1e2ace651495b74ae22d45d1723443fd00ecd3a` checked embeddings,
+every block's residual output, final normalized activations, and all vocabulary
+logits. With Apple Clang 21, the maximum absolute logit difference was approximately
+`0.000153`; greedy choices matched at every position.

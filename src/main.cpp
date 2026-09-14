@@ -500,7 +500,7 @@ namespace {
 
             struct TensorDefinition {
                 std::string_view name;
-                std::initializer_list<uint64_t> shape;
+                std::vector<uint64_t> shape;
             };
 
             const std::array<TensorDefinition, 16> definitions{
@@ -528,7 +528,10 @@ namespace {
 
             uint64_t byte_offset = kHeaderBytes;
             for (const TensorDefinition& definition : definitions) {
-                const uint64_t elements = checked_multiply(definition.shape);
+                uint64_t elements = 1;
+                for (const uint64_t dimension : definition.shape) {
+                    elements = checked_multiply({ elements, dimension });
+                }
                 layout.push_back(
                     ParameterTensor{
                         .name = definition.name,

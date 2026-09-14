@@ -50,4 +50,16 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/../llm.c-reference/gpt2_tokenizer.bin
     )
     set_tests_properties(tokenizer_tests PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_test(
+        NAME checkpoint_generation_tests
+        COMMAND ${CMAKE_COMMAND}
+            -DINSPECTOR=$<TARGET_FILE:checkpoint_inspector>
+            -DCHECKPOINT=${CMAKE_CURRENT_SOURCE_DIR}/../llm.c-reference/gpt2_124M.bin
+            -DTOKENIZER=${CMAKE_CURRENT_SOURCE_DIR}/../llm.c-reference/gpt2_tokenizer.bin
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/checkpoint_generation_tests.cmake
+    )
+    set_tests_properties(checkpoint_generation_tests PROPERTIES
+        SKIP_REGULAR_EXPRESSION "SKIP: GPT-2 artifacts are unavailable"
+    )
 endif()
