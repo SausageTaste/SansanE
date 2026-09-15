@@ -1263,7 +1263,7 @@ namespace {
         // 2. Pass the entire context through every Transformer block. Each
         // block loads its weights once and applies them to every token row.
         for (size_t layer = 0; layer < config.layer_count(); ++layer) {
-            auto block = transformer_block(
+            const auto block = transformer_block(
                 checkpoint_path, config, hidden_states, layer
             );
 
