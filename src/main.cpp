@@ -69,6 +69,23 @@ namespace {
         const float& operator()(const size_t row, const size_t column) const {
             return values[row * column_count + column];
         }
+
+        float row_mean(const size_t row) const {
+            float mean = 0.0F;
+            for (size_t column = 0; column < column_count; ++column) {
+                mean += (*this)(row, column);
+            }
+            return mean / static_cast<float>(column_count);
+        }
+
+        float row_variance(const size_t row, const float mean) const {
+            float variance = 0.0F;
+            for (size_t column = 0; column < column_count; ++column) {
+                const float difference = (*this)(row, column) - mean;
+                variance += difference * difference;
+            }
+            return variance / static_cast<float>(column_count);
+        }
     };
 
     struct QkvMatrices {
@@ -654,18 +671,8 @@ namespace {
 
         ActivationMatrix output(input.row_count, input.column_count);
         for (size_t row = 0; row < input.row_count; ++row) {
-            float mean = 0.0F;
-            for (size_t column = 0; column < input.column_count; ++column) {
-                mean += input(row, column);
-            }
-            mean /= static_cast<float>(input.column_count);
-
-            float variance = 0.0F;
-            for (size_t column = 0; column < input.column_count; ++column) {
-                const float difference = input(row, column) - mean;
-                variance += difference * difference;
-            }
-            variance /= static_cast<float>(input.column_count);
+            const float mean = input.row_mean(row);
+            const float variance = input.row_variance(row, mean);
 
             const float inverse_standard_deviation =
                 1.0F / std::sqrt(variance + epsilon);
