@@ -52,6 +52,8 @@ namespace {
         return product;
     }
 
+    struct QkvMatrices;
+
     struct ActivationMatrix {
         size_t row_count;
         size_t column_count;
@@ -86,6 +88,41 @@ namespace {
             }
             return variance / static_cast<float>(column_count);
         }
+
+        ActivationMatrix add_elementwise(const ActivationMatrix& other) const {
+            if (row_count != other.row_count ||
+                column_count != other.column_count) {
+                throw std::invalid_argument(
+                    "cannot add activation matrices with different dimensions"
+                );
+            }
+
+            ActivationMatrix result(row_count, column_count);
+            for (size_t index = 0; index < result.values.size(); ++index) {
+                result.values[index] = values[index] + other.values[index];
+            }
+            return result;
+        }
+
+        ActivationMatrix gelu() const {
+            constexpr float kScalingFactor = 0.7978845608028654F;
+            constexpr float kCubicCoefficient = 0.044715F;
+
+            ActivationMatrix output(row_count, column_count);
+            for (size_t index = 0; index < values.size(); ++index) {
+                const float value = values[index];
+                const float cubic = value * value * value;
+                output.values[index] =
+                    0.5F * value *
+                    (1.0F + std::tanh(
+                                kScalingFactor *
+                                (value + kCubicCoefficient * cubic)
+                            ));
+            }
+            return output;
+        }
+
+        QkvMatrices split_qkv(const size_t channel_count) const;
     };
 
     struct QkvMatrices {
@@ -636,23 +673,6 @@ namespace {
         return header;
     }
 
-    ActivationMatrix add_elementwise(
-        const ActivationMatrix& left, const ActivationMatrix& right
-    ) {
-        if (left.row_count != right.row_count ||
-            left.column_count != right.column_count) {
-            throw std::invalid_argument(
-                "cannot add activation matrices with different dimensions"
-            );
-        }
-
-        ActivationMatrix result(left.row_count, left.column_count);
-        for (size_t index = 0; index < result.values.size(); ++index) {
-            result.values[index] = left.values[index] + right.values[index];
-        }
-        return result;
-    }
-
     ActivationMatrix layer_norm(
         const ActivationMatrix& input,
         const std::vector<float>& weight,
@@ -782,26 +802,8 @@ namespace {
         return maximum_index;
     }
 
-    ActivationMatrix gelu(const ActivationMatrix& input) {
-        constexpr float kScalingFactor = 0.7978845608028654F;
-        constexpr float kCubicCoefficient = 0.044715F;
-
-        ActivationMatrix output(input.row_count, input.column_count);
-        for (size_t index = 0; index < input.values.size(); ++index) {
-            const float value = input.values[index];
-            const float cubic = value * value * value;
-            output.values[index] =
-                0.5F * value *
-                (1.0F + std::tanh(
-                            kScalingFactor * (value + kCubicCoefficient * cubic)
-                        ));
-        }
-        return output;
-    }
-
-    QkvMatrices split_qkv(
-        const ActivationMatrix& combined, const size_t channel_count
-    ) {
+    QkvMatrices ActivationMatrix::split_qkv(const size_t channel_count) const {
+        const ActivationMatrix& combined = *this;
         if (combined.column_count != 3 * channel_count) {
             throw std::invalid_argument(
                 "combined QKV dimensions do not match the channel count"
@@ -961,7 +963,7 @@ namespace {
         const auto combined_qkv = linear(
             normalized_for_attention, qkv_weight, qkv_bias
         );
-        const auto qkv = split_qkv(combined_qkv, config.channel_count());
+        const auto qkv = combined_qkv.split_qkv(config.channel_count());
 
         // 3. Run scaled dot-product attention independently in every head and
         // concatenate the head outputs back into one channel vector.
@@ -978,7 +980,7 @@ namespace {
         const auto projected_attention = linear(
             attention.output, attention_weight, attention_bias
         );
-        const auto post_attention = add_elementwise(input, projected_attention);
+        const auto post_attention = input.add_elementwise(projected_attention);
 
         // 5. A second pre-normalization prepares the residual stream for the
         // block's feed-forward MLP without modifying the residual bypass.
@@ -1003,7 +1005,7 @@ namespace {
         const auto expanded = linear(
             normalized_for_mlp, expansion_weight, expansion_bias
         );
-        const auto activated = gelu(expanded);
+        const auto activated = expanded.gelu();
         const auto projection_weight = config.read_mlp_projection_weight(
             checkpoint_path, layer_index
         );
@@ -1017,7 +1019,7 @@ namespace {
         // 7. The second residual addition completes this Transformer block and
         // supplies the input residual stream for the following layer.
         return TransformerBlockResult{
-            .output = add_elementwise(post_attention, projected_mlp),
+            .output = post_attention.add_elementwise(projected_mlp),
             .inspected_scores = std::move(attention.inspected_scores),
             .inspected_probabilities =
                 std::move(attention.inspected_probabilities),
