@@ -6,10 +6,10 @@ This document follows [`transformer_block`](../src/main.cpp) in execution order.
 
 GPT-2 chooses one model width, called $C$ here. In this implementation, **the token embedding dimension, position embedding dimension, and channel count of the residual stream are all that same $C$ by design**. For GPT-2 124M, $C=768$. It is not a numerical coincidence, and the channel count is not a multiple calculated from a separate embedding dimension.
 
-The checkpoint header stores `channel_count`. The code uses it to define the token-embedding table `wte` with shape $V_{\mathrm{pad}}\times C$ and the position-embedding table `wpe` with shape $T_{\max}\times C$. Here $V_{\mathrm{pad}}$ is the padded table row count, and $T_{\max}$ is the maximum number of positions. Looking up one row of each table gives two vectors of length $C$, which the code adds to create the first hidden state at position $t$:
+The checkpoint header stores `channel_count`. The code uses it to define the token-embedding table `wte` with shape $V_{\mathrm{pad}}\times C$ and the position-embedding table `wpe` with shape $T_{\max}\times C$. Here $V_{\mathrm{pad}}$ is the padded table row count, and $T_{\max}$ is the maximum number of positions. Let $i_t$ be the token ID at position $t$. Looking up one row of each table gives two vectors of length $C$, which the code adds to create the first hidden state at that position:
 
 $$
-x_t=\mathrm{wte}[\text{token\_id}_t,:]
+x_t=\mathrm{wte}[i_t,:]
 +\mathrm{wpe}[t,:]\in\mathbb{R}^{C}.
 $$
 
