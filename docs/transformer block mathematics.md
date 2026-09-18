@@ -2,6 +2,86 @@
 
 This document follows [`transformer_block`](../src/main.cpp) in execution order. It describes **one GPT-2 Transformer layer** during inference. The input already contains token and position embeddings; the final LayerNorm and vocabulary projection happen after all Transformer blocks.
 
+## First, what is a channel?
+
+For each token position, the model keeps a list of numbers representing that token at the current stage of computation. One entry in that list is a **channel**, also called a feature or hidden dimension. In this code, the list has 768 entries, so the model has 768 channels. `ActivationMatrix(position, channel)` reads one such number.
+
+For example, if the context has three tokens and four channels in a toy model, its activations might look like this:
+
+$$
+X=\begin{bmatrix}
+ 0.2 & -0.1 & 0.8 & 0.4 \\
+ 0.5 &  0.3 & 0.1 & -0.2 \\
+-0.4 &  0.7 & 0.6 & 0.9
+\end{bmatrix}
+\quad\text{with shape }3\times4.
+$$
+
+The second row is the four-number representation of the token at position 1. The value $X_{1,2}=0.1$ is channel 2 at that position. A channel is **a coordinate of a learned representation**, not a character, a word, an attention head, or a human-assigned concept. Its meaning depends on the learned weights and on the other channels. The same channel index exists at every token position, but its value can differ at each position. The initial row comes from token and position embeddings; after attention, the row can also reflect earlier tokens.
+
+The 768-channel width is maintained at the input and output of every GPT-2 block so residual additions can add two rows element by element. Inside a block, some intermediate vectors have different widths: Q, K, and V each have 768 channels; their combined projection has $3\cdot768=2304$ channels; the MLP temporarily expands to $4\cdot768=3072$ channels. These are widths of intermediate representations, not extra tokens.
+
+## Terms used in the equations
+
+### Reading the notation
+
+- **Scalar, vector, matrix, tensor:** A scalar is one number. A vector is a one-dimensional list of numbers, such as one token's hidden state. A matrix is a two-dimensional grid of numbers, such as all token rows together. *Tensor* is the general name for an array with any number of dimensions; in this document, the activations are mostly matrices.
+- **Shape / dimension / width:** The shape lists an array's sizes along each axis. A $T\times C$ activation matrix has $T$ rows (token positions) and $C$ columns (channels). Its width is $C$. For the toy matrix above, $T=3$ and $C=4$. This implementation has no separate batch axis in `ActivationMatrix`.
+- **Index / subscript:** $X_{t,c}$ means the number in row $t$, column $c$ of $X$. The first index selects a position; the second selects a channel. All indices in this document start at zero.
+- **Elementwise operation:** Apply an operation to matching entries. For example, $(X+O)_{t,c}=X_{t,c}+O_{t,c}$. This requires $X$ and $O$ to have the same shape.
+- **Dot product:** Multiply corresponding entries of two equal-length vectors and add the products. For example, $(a_0,a_1)\cdot(b_0,b_1)=a_0b_0+a_1b_1$. Attention uses this to compare a query with a key.
+- **Weighted sum:** Multiply each value vector by its weight, then add the results. In attention, the weights are softmax probabilities and the vectors are values from allowed token positions.
+
+### Input and representation
+
+- **Token:** A unit produced by GPT-2's tokenizer. It can represent a word, part of a word, punctuation, or other text bytes. One token ID selects one row from the token-embedding table.
+- **Position:** A token's zero-based place in the current input sequence. If there are $T$ tokens, the positions are $0,\ldots,T-1$. This is the row index of `ActivationMatrix`.
+- **Context / sequence:** The tokens supplied together to the model for a forward pass. Here `transformer_block` processes all $T$ positions. A causal rule controls which earlier positions each position can use.
+- **Embedding:** A learned vector looked up for a token ID or a position. Before the first block, the code adds token and position embeddings to form each input row. An embedding gives the model numbers to work with; its individual coordinates are channels.
+- **Activation:** A number computed during the forward pass, as opposed to a stored model parameter. `input`, normalized rows, Q/K/V, attention outputs, and MLP outputs are all activations. `ActivationMatrix` stores a matrix of them.
+- **Hidden state:** The current vector of activations for a token position. The full $T\times C$ matrix contains one hidden-state row per position. These rows change as they pass through successive blocks.
+- **Residual stream:** The $T\times C$ matrix carried from block to block. Each block adds attention and MLP results to this stream. The variable `input` is the stream entering this block; `post_attention` is the stream after the first addition.
+
+### Model structure and operations
+
+- **Layer / Transformer block:** One repeated unit of computation. This implementation's block contains attention and an MLP, each preceded by LayerNorm and followed by a residual addition. GPT-2 124M repeats it 12 times; `layer_index` chooses one unit's parameters.
+- **Parameter / weight / bias:** A number learned during training and saved in the checkpoint. A weight matrix determines how input channels contribute to output channels. A bias vector adds one learned offset per output channel. During this inference pass, they are read but not updated.
+- **Linear projection:** For each token row, multiply by a weight matrix and add a bias. Despite the name, the bias makes it an affine operation. A projection can change the width, such as $C\to3C$ or $C\to4C$, or keep it at $C\to C$. It mixes channels within a row; by itself, it does not mix token positions.
+- **LayerNorm:** For each token row separately, compute the mean and variance across its channels, normalize the row, and apply learned scale $\gamma$ and offset $\beta$. It does not average across tokens. The small $\varepsilon$ inside the square root prevents division by zero or a very small number.
+- **Pre-normalization:** Normalize the input *before* sending it to attention or the MLP. The unnormalized residual stream goes around each operation and is used in the addition. This is why the first residual is $X+O$, rather than $N^{(1)}+O$.
+- **Residual connection / skip connection:** Add an operation's output to the stream that entered that part of the block. This block has two: `input + projected_attention` and `post_attention + projected_mlp`. Both summands must have shape $T\times C$.
+- **MLP / feed-forward network:** The two linear projections with a GELU activation between them. It transforms each token row independently. Here the first projection expands $C\to4C$ and the second contracts $4C\to C$.
+- **GELU:** The non-linear activation applied to each MLP value. Unlike a linear projection, it cannot be collapsed into one matrix multiplication with the neighboring projections. The code uses a tanh approximation shown in step 6.
+
+### Attention
+
+- **Self-attention:** A way for a token position to combine information from other positions in the *same* sequence. The position's query is compared with keys, and the resulting weights select a weighted mixture of values. This is where token positions interact inside the block.
+- **Query (Q):** What a position uses to score possible source positions. Each position has a query vector for every head.
+- **Key (K):** What a possible source position presents for comparison with a query. The dot product of a query and key becomes an attention score.
+- **Value (V):** The vector of information a source position contributes after the scores become attention probabilities. Keys determine *how much* to read; values determine *what vector* gets mixed into the result. Q, K, and V are different learned projections of the same normalized input.
+- **Attention head:** One separate attention calculation over a slice of the Q, K, and V channels. With $H=12$ heads and $C=768$ channels, each head works with $d=C/H=64$ Q channels, 64 K channels, and 64 V channels. Its output has 64 channels. The outputs of all heads are concatenated into 768 channels.
+- **Attention score:** The query-key dot product divided by $\sqrt d$. It is a raw compatibility number, not yet a probability. The scaling keeps dot products from growing too large as $d$ grows.
+- **Softmax / attention probability:** Softmax exponentiates and normalizes the allowed scores so each probability is nonnegative and the probabilities for one query and head sum to 1. These probabilities weight the value vectors.
+- **Causal mask:** The rule that a query at position $t$ can use keys and values at positions $0,\ldots,t$, but not later positions. The code enforces this by never constructing scores for future positions. Thus the last position can see the whole context, while the first can see only itself.
+- **Multi-head attention:** Run the attention calculation separately for each head, concatenate their outputs, then use the attention output projection to mix channels across heads.
+
+### Scope of this block
+
+- **Inference:** Use trained parameters to compute outputs. This block performs a forward pass; it has no gradients or parameter updates.
+- **Logit:** An unnormalized score for a vocabulary token. Logits are computed *after* all Transformer blocks and the final LayerNorm, so they are different from the attention scores inside this document.
+
+## A small attention example
+
+Suppose a toy model has $C=4$ channels and $H=2$ heads, so each head has $d=2$ channels. Head 0 uses channels 0 and 1; head 1 uses channels 2 and 3. At query position $t=1$, neither head may read position 2.
+
+For head 0, imagine $q_{1,0}=(1,0)$, $k_{0,0}=(1,0)$, and $k_{1,0}=(0,1)$. The allowed scores are $s_{0,1,0}=1/\sqrt2$ and $s_{0,1,1}=0$. Softmax makes their probabilities approximately $0.67$ and $0.33$. If $v_{0,0}=(2,0)$ and $v_{1,0}=(0,4)$, the output is approximately
+
+$$
+a_{1,0}=0.67(2,0)+0.33(0,4)=(1.34,1.32).
+$$
+
+This two-number output fills head 0's part of position 1's attention row. Head 1 fills the remaining two channels. The full four-channel row then goes through the attention output projection and is added to the original input row.
+
 ## Shapes and notation
 
 Let $T$ be the number of tokens in the current context, $C$ the number of channels, $H$ the number of attention heads, and $d=C/H$ the channels per head. For GPT-2 124M, $C=768$, $H=12$, and $d=64$. Positions and channels below use zero-based indices, as in the code.
