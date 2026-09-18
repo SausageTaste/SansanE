@@ -9,8 +9,8 @@ GPT-2 chooses one model width, called $C$ here. In this implementation, **the to
 The checkpoint header stores `channel_count`. The code uses it to define the token-embedding table `wte` with shape $V_{\mathrm{pad}}\times C$ and the position-embedding table `wpe` with shape $T_{\max}\times C$. Here $V_{\mathrm{pad}}$ is the padded table row count, and $T_{\max}$ is the maximum number of positions. Looking up one row of each table gives two vectors of length $C$, which the code adds to create the first hidden state at position $t$:
 
 $$
-x_t=\operatorname{wte}[\text{token\_id}_t,:]
-+\operatorname{wpe}[t,:]\in\mathbb{R}^{C}.
+x_t=\mathrm{wte}[\text{token\_id}_t,:]
++\mathrm{wpe}[t,:]\in\mathbb{R}^{C}.
 $$
 
 A block receives $T$ such rows and returns $T$ rows of the same width:
@@ -118,10 +118,10 @@ Let $T$ be the number of tokens in the current context, $C$ the number of channe
 Each row is one token position. A `linear` call with input $U\in\mathbb{R}^{T\times I}$, stored weight $W\in\mathbb{R}^{O\times I}$, and bias $b\in\mathbb{R}^{O}$ computes
 
 $$
-\operatorname{Linear}(U;W,b)_{t,o}
+\mathrm{Linear}(U;W,b)_{t,o}
 =b_o+\sum_{i=0}^{I-1}W_{o,i}U_{t,i},
 \qquad\text{or}\qquad
-\operatorname{Linear}(U;W,b)=UW^{\mathsf T}+b.
+\mathrm{Linear}(U;W,b)=UW^{\mathsf T}+b.
 $$
 
 The bias is added to every row. The transpose matters: checkpoint weights are stored with **output channels first**, while token activations are rows.
@@ -151,7 +151,7 @@ Here `ln1w` is $\gamma^{(1)}$ and `ln1b` is $\beta^{(1)}$. The variance divides 
 The block makes one linear projection with $3C$ output channels:
 
 $$
-P=\operatorname{Linear}(N^{(1)};W_{qkv},b_{qkv})
+P=\mathrm{Linear}(N^{(1)};W_{qkv},b_{qkv})
 \in\mathbb{R}^{T\times 3C},
 \qquad
 W_{qkv}\in\mathbb{R}^{3C\times C}.
@@ -205,7 +205,7 @@ Writing each $a_{t,h}$ into its own channel range concatenates the heads into $A
 ## 4. Project attention and add the first residual
 
 $$
-O=\operatorname{Linear}(A;W_{att},b_{att}),
+O=\mathrm{Linear}(A;W_{att},b_{att}),
 \qquad W_{att}\in\mathbb{R}^{C\times C},
 $$
 
@@ -220,7 +220,7 @@ The addition is elementwise over positions and channels. Notice that the bypass 
 The same LayerNorm formula is applied to each row of $R$, now with the second set of learned parameters:
 
 $$
-N^{(2)}=\operatorname{LayerNorm}(R;\gamma^{(2)},\beta^{(2)},10^{-5}).
+N^{(2)}=\mathrm{LayerNorm}(R;\gamma^{(2)},\beta^{(2)},10^{-5}).
 $$
 
 `ln2w` and `ln2b` hold $\gamma^{(2)}$ and $\beta^{(2)}$. The residual stream $R$ stays available for the final addition.
@@ -230,7 +230,7 @@ $$
 The MLP is applied independently to each token row; it does not mix token positions. First it expands $C$ channels to $4C$:
 
 $$
-F=\operatorname{Linear}(N^{(2)};W_{fc},b_{fc}),
+F=\mathrm{Linear}(N^{(2)};W_{fc},b_{fc}),
 \qquad W_{fc}\in\mathbb{R}^{4C\times C},
 \qquad F\in\mathbb{R}^{T\times 4C}.
 $$
@@ -248,7 +248,7 @@ $$
 Finally, another linear projection returns to $C$ channels:
 
 $$
-M=\operatorname{Linear}(G;W_{proj},b_{proj}),
+M=\mathrm{Linear}(G;W_{proj},b_{proj}),
 \qquad W_{proj}\in\mathbb{R}^{C\times 4C},
 \qquad M\in\mathbb{R}^{T\times C}.
 $$
@@ -265,11 +265,11 @@ $$
 
 $$
 \begin{aligned}
-R &= X+\operatorname{AttentionProjection}\!\left(
-\operatorname{CausalMultiHeadAttention}\!\left(
-\operatorname{QKV}\!\left(\operatorname{LayerNorm}_1(X)\right)
+R &= X+\mathrm{AttentionProjection}\!\left(
+\mathrm{CausalMultiHeadAttention}\!\left(
+\mathrm{QKV}\!\left(\mathrm{LayerNorm}_1(X)\right)
 \right)\right),\\
-Y &= R+\operatorname{MLP}\!\left(\operatorname{LayerNorm}_2(R)\right).
+Y &= R+\mathrm{MLP}\!\left(\mathrm{LayerNorm}_2(R)\right).
 \end{aligned}
 $$
 
