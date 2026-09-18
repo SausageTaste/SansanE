@@ -2,9 +2,30 @@
 
 This document follows [`transformer_block`](../src/main.cpp) in execution order. It describes **one GPT-2 Transformer layer** during inference. The input already contains token and position embeddings; the final LayerNorm and vocabulary projection happen after all Transformer blocks.
 
+## The key relationship: embedding dimension = block width
+
+GPT-2 chooses one model width, called $C$ here. In this implementation, **the token embedding dimension, position embedding dimension, and channel count of the residual stream are all that same $C$ by design**. For GPT-2 124M, $C=768$. It is not a numerical coincidence, and the channel count is not a multiple calculated from a separate embedding dimension.
+
+The checkpoint header stores `channel_count`. The code uses it to define the token-embedding table `wte` with shape $V_{\mathrm{pad}}\times C$ and the position-embedding table `wpe` with shape $T_{\max}\times C$. Here $V_{\mathrm{pad}}$ is the padded table row count, and $T_{\max}$ is the maximum number of positions. Looking up one row of each table gives two vectors of length $C$, which the code adds to create the first hidden state at position $t$:
+
+$$
+x_t=\operatorname{wte}[\text{token\_id}_t,:]
++\operatorname{wpe}[t,:]\in\mathbb{R}^{C}.
+$$
+
+A block receives $T$ such rows and returns $T$ rows of the same width:
+
+$$
+X^{(\ell)}\in\mathbb{R}^{T\times C}
+\xrightarrow{\text{Transformer block }\ell}
+X^{(\ell+1)}\in\mathbb{R}^{T\times C}.
+$$
+
+Keeping that width lets each block add its attention and MLP results to the residual stream. The vocabulary size $V$ counts **how many valid token IDs** have embeddings; $C$ counts **how many numbers are in each embedding**. The number of heads $H$ is another separate choice, with the constraint that $H$ divides $C$ so each head has $d=C/H$ channels. A model could be designed with a different embedding width and an extra conversion projection, but this GPT-2 implementation does not have one.
+
 ## First, what is a channel?
 
-For each token position, the model keeps a list of numbers representing that token at the current stage of computation. One entry in that list is a **channel**, also called a feature or hidden dimension. In this code, the list has 768 entries, so the model has 768 channels. `ActivationMatrix(position, channel)` reads one such number.
+For each token position, the model keeps a list of numbers representing that token at the current stage of computation. One entry in that list is a **channel**, also called a feature or hidden dimension. Here the list has the model width $C=768$ entries, so the residual stream has 768 channels. `ActivationMatrix(position, channel)` reads one such number.
 
 For example, if the context has three tokens and four channels in a toy model, its activations might look like this:
 
@@ -37,7 +58,7 @@ The 768-channel width is maintained at the input and output of every GPT-2 block
 - **Token:** A unit produced by GPT-2's tokenizer. It can represent a word, part of a word, punctuation, or other text bytes. One token ID selects one row from the token-embedding table.
 - **Position:** A token's zero-based place in the current input sequence. If there are $T$ tokens, the positions are $0,\ldots,T-1$. This is the row index of `ActivationMatrix`.
 - **Context / sequence:** The tokens supplied together to the model for a forward pass. Here `transformer_block` processes all $T$ positions. A causal rule controls which earlier positions each position can use.
-- **Embedding:** A learned vector looked up for a token ID or a position. Before the first block, the code adds token and position embeddings to form each input row. An embedding gives the model numbers to work with; its individual coordinates are channels.
+- **Embedding:** A learned vector looked up for a token ID or a position. Before the first block, the code adds token and position embeddings to form each input row. Both embedding vectors have width $C$, the same as the block input and output; their individual coordinates are channels.
 - **Activation:** A number computed during the forward pass, as opposed to a stored model parameter. `input`, normalized rows, Q/K/V, attention outputs, and MLP outputs are all activations. `ActivationMatrix` stores a matrix of them.
 - **Hidden state:** The current vector of activations for a token position. The full $T\times C$ matrix contains one hidden-state row per position. These rows change as they pass through successive blocks.
 - **Residual stream:** The $T\times C$ matrix carried from block to block. Each block adds attention and MLP results to this stream. The variable `input` is the stream entering this block; `post_attention` is the stream after the first addition.
