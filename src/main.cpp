@@ -112,12 +112,12 @@ namespace {
             for (size_t index = 0; index < values.size(); ++index) {
                 const float value = values[index];
                 const float cubic = value * value * value;
-                output.values[index] =
-                    0.5F * value *
-                    (1.0F + std::tanh(
-                                kScalingFactor *
-                                (value + kCubicCoefficient * cubic)
-                            ));
+                output.values[index] = 0.5F * value *
+                                       (1.0F +
+                                        std::tanh(
+                                            kScalingFactor *
+                                            (value + kCubicCoefficient * cubic)
+                                        ));
             }
             return output;
         }
@@ -176,9 +176,10 @@ namespace {
         using HeaderBuffer = std::array<int32_t, kHeaderElementCount>;
 
     public:
-        static Gpt2Config create(const HeaderBuffer& header) {
+        static Gpt2Config create(const sung::Path& checkpoint_path) {
             Gpt2Config output;
-            output.parse(header);
+            output.checkpoint_path_ = checkpoint_path;
+            output.parse(read_header(checkpoint_path));
             output.layout_ = output.make_parameter_layout();
             return output;
         }
@@ -220,28 +221,24 @@ namespace {
             return static_cast<size_t>(max_sequence_length_);
         }
 
-        std::vector<float> read_token_embedding(
-            const sung::Path& checkpoint_path, const uint64_t token_id
-        ) const {
+        std::vector<float> read_token_embedding(const uint64_t token_id) const {
             if (token_id >= vocabulary_size_) {
                 throw std::out_of_range(
                     "token ID " + std::to_string(token_id) +
                     " is outside the vocabulary"
                 );
             }
-            return read_tensor_row(checkpoint_path, layout_[0], token_id);
+            return read_tensor_row(layout_[0], token_id);
         }
 
-        std::vector<float> read_token_embedding_table(
-            const sung::Path& checkpoint_path
-        ) const {
+        std::vector<float> read_token_embedding_table() const {
             return read_tensor_elements(
-                checkpoint_path, layout_[0], 0, layout_[0].element_count
+                layout_[0], 0, layout_[0].element_count
             );
         }
 
         std::vector<float> read_position_embedding(
-            const sung::Path& checkpoint_path, const uint64_t position
+            const uint64_t position
         ) const {
             if (position >= max_sequence_length_) {
                 throw std::out_of_range(
@@ -249,32 +246,31 @@ namespace {
                     " is outside the maximum sequence length"
                 );
             }
-            return read_tensor_row(checkpoint_path, layout_[1], position);
+            return read_tensor_row(layout_[1], position);
         }
 
         std::vector<float> read_first_layer_norm_weight(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
-            return read_tensor_row(checkpoint_path, layout_[2], layer_index);
+            return read_tensor_row(layout_[2], layer_index);
         }
 
         std::vector<float> read_first_layer_norm_bias(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
-            return read_tensor_row(checkpoint_path, layout_[3], layer_index);
+            return read_tensor_row(layout_[3], layer_index);
         }
 
         std::vector<float> read_qkv_projection_weight(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
             const uint64_t elements_per_layer = checked_multiply(
                 { 3, channel_count_, channel_count_ }
             );
             return read_tensor_elements(
-                checkpoint_path,
                 layout_[4],
                 checked_multiply({ layer_index, elements_per_layer }),
                 elements_per_layer
@@ -282,14 +278,13 @@ namespace {
         }
 
         std::vector<float> read_qkv_projection_bias(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
             const uint64_t elements_per_layer = checked_multiply(
                 { 3, channel_count_ }
             );
             return read_tensor_elements(
-                checkpoint_path,
                 layout_[5],
                 checked_multiply({ layer_index, elements_per_layer }),
                 elements_per_layer
@@ -297,14 +292,13 @@ namespace {
         }
 
         std::vector<float> read_attention_projection_weight(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
             const uint64_t elements_per_layer = checked_multiply(
                 { channel_count_, channel_count_ }
             );
             return read_tensor_elements(
-                checkpoint_path,
                 layout_[6],
                 checked_multiply({ layer_index, elements_per_layer }),
                 elements_per_layer
@@ -312,35 +306,34 @@ namespace {
         }
 
         std::vector<float> read_attention_projection_bias(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
-            return read_tensor_row(checkpoint_path, layout_[7], layer_index);
+            return read_tensor_row(layout_[7], layer_index);
         }
 
         std::vector<float> read_second_layer_norm_weight(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
-            return read_tensor_row(checkpoint_path, layout_[8], layer_index);
+            return read_tensor_row(layout_[8], layer_index);
         }
 
         std::vector<float> read_second_layer_norm_bias(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
-            return read_tensor_row(checkpoint_path, layout_[9], layer_index);
+            return read_tensor_row(layout_[9], layer_index);
         }
 
         std::vector<float> read_mlp_expansion_weight(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
             const uint64_t elements_per_layer = checked_multiply(
                 { 4, channel_count_, channel_count_ }
             );
             return read_tensor_elements(
-                checkpoint_path,
                 layout_[10],
                 checked_multiply({ layer_index, elements_per_layer }),
                 elements_per_layer
@@ -348,14 +341,13 @@ namespace {
         }
 
         std::vector<float> read_mlp_expansion_bias(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
             const uint64_t elements_per_layer = checked_multiply(
                 { 4, channel_count_ }
             );
             return read_tensor_elements(
-                checkpoint_path,
                 layout_[11],
                 checked_multiply({ layer_index, elements_per_layer }),
                 elements_per_layer
@@ -363,14 +355,13 @@ namespace {
         }
 
         std::vector<float> read_mlp_projection_weight(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
             const uint64_t elements_per_layer = checked_multiply(
                 { 4, channel_count_, channel_count_ }
             );
             return read_tensor_elements(
-                checkpoint_path,
                 layout_[12],
                 checked_multiply({ layer_index, elements_per_layer }),
                 elements_per_layer
@@ -378,25 +369,21 @@ namespace {
         }
 
         std::vector<float> read_mlp_projection_bias(
-            const sung::Path& checkpoint_path, const uint64_t layer_index
+            const uint64_t layer_index
         ) const {
             validate_layer_index(layer_index);
-            return read_tensor_row(checkpoint_path, layout_[13], layer_index);
+            return read_tensor_row(layout_[13], layer_index);
         }
 
-        std::vector<float> read_final_layer_norm_weight(
-            const sung::Path& checkpoint_path
-        ) const {
+        std::vector<float> read_final_layer_norm_weight() const {
             return read_tensor_elements(
-                checkpoint_path, layout_[14], 0, layout_[14].element_count
+                layout_[14], 0, layout_[14].element_count
             );
         }
 
-        std::vector<float> read_final_layer_norm_bias(
-            const sung::Path& checkpoint_path
-        ) const {
+        std::vector<float> read_final_layer_norm_bias() const {
             return read_tensor_elements(
-                checkpoint_path, layout_[15], 0, layout_[15].element_count
+                layout_[15], 0, layout_[15].element_count
             );
         }
 
@@ -415,9 +402,7 @@ namespace {
         }
 
         std::vector<float> read_tensor_row(
-            const sung::Path& checkpoint_path,
-            const ParameterTensor& tensor,
-            const uint64_t row_index
+            const ParameterTensor& tensor, const uint64_t row_index
         ) const {
             if (tensor.shape.size() != 2 || tensor.shape[1] != channel_count_) {
                 throw std::runtime_error(
@@ -432,7 +417,6 @@ namespace {
 
             const uint64_t row_elements = tensor.shape[1];
             return read_tensor_elements(
-                checkpoint_path,
                 tensor,
                 checked_multiply({ row_index, row_elements }),
                 row_elements
@@ -440,7 +424,6 @@ namespace {
         }
 
         std::vector<float> read_tensor_elements(
-            const sung::Path& checkpoint_path,
             const ParameterTensor& tensor,
             const uint64_t element_offset,
             const uint64_t element_count
@@ -478,10 +461,10 @@ namespace {
                 );
             }
 
-            std::ifstream checkpoint{ checkpoint_path, std::ios::binary };
+            std::ifstream checkpoint{ checkpoint_path_, std::ios::binary };
             if (!checkpoint) {
                 throw std::runtime_error(
-                    "cannot open checkpoint: " + checkpoint_path.string()
+                    "cannot open checkpoint: " + checkpoint_path_.string()
                 );
             }
 
@@ -505,6 +488,35 @@ namespace {
                 );
             }
             return elements;
+        }
+
+        static HeaderBuffer read_header(const sung::Path& checkpoint_path) {
+            if constexpr (std::endian::native != std::endian::little) {
+                throw std::runtime_error(
+                    "this checkpoint reader currently requires a "
+                    "little-endian system"
+                );
+            }
+
+            std::ifstream checkpoint{ checkpoint_path, std::ios::binary };
+            if (!checkpoint) {
+                throw std::runtime_error(
+                    "cannot open checkpoint: " + checkpoint_path.string()
+                );
+            }
+
+            HeaderBuffer header{};
+            checkpoint.read(
+                reinterpret_cast<char*>(header.data()),
+                static_cast<std::streamsize>(sizeof(header))
+            );
+            if (checkpoint.gcount() !=
+                static_cast<std::streamsize>(sizeof(header))) {
+                throw std::runtime_error(
+                    "checkpoint is too small to contain its header"
+                );
+            }
+            return header;
         }
 
         void parse(const HeaderBuffer& header) {
@@ -601,6 +613,7 @@ namespace {
             return layout;
         }
 
+        sung::Path checkpoint_path_;
         uint64_t max_sequence_length_;
         uint64_t vocabulary_size_;
         uint64_t padded_vocabulary_size_;
@@ -643,35 +656,6 @@ namespace {
         return os;
     }
 
-
-    Gpt2Config::HeaderBuffer read_header(const sung::Path& checkpoint_path) {
-        if constexpr (std::endian::native != std::endian::little) {
-            throw std::runtime_error(
-                "this checkpoint reader currently requires a little-endian "
-                "system"
-            );
-        }
-
-        std::ifstream checkpoint{ checkpoint_path, std::ios::binary };
-        if (!checkpoint) {
-            throw std::runtime_error(
-                "cannot open checkpoint: " + checkpoint_path.string()
-            );
-        }
-
-        Gpt2Config::HeaderBuffer header{};
-        checkpoint.read(
-            reinterpret_cast<char*>(header.data()),
-            static_cast<std::streamsize>(sizeof(header))
-        );
-        if (checkpoint.gcount() !=
-            static_cast<std::streamsize>(sizeof(header))) {
-            throw std::runtime_error(
-                "checkpoint is too small to contain its header"
-            );
-        }
-        return header;
-    }
 
     ActivationMatrix layer_norm(
         const ActivationMatrix& input,
@@ -928,7 +912,6 @@ namespace {
     }
 
     TransformerBlockResult transformer_block(
-        const sung::Path& checkpoint_path,
         const Gpt2Config& config,
         const ActivationMatrix& input,
         const size_t layer_index
@@ -943,10 +926,10 @@ namespace {
         // 1. GPT-2 uses pre-normalization: attention receives a normalized
         // copy while the original residual stream bypasses the operation.
         const auto first_norm_weight = config.read_first_layer_norm_weight(
-            checkpoint_path, layer_index
+            layer_index
         );
         const auto first_norm_bias = config.read_first_layer_norm_bias(
-            checkpoint_path, layer_index
+            layer_index
         );
         const auto normalized_for_attention = layer_norm(
             input, first_norm_weight, first_norm_bias
@@ -954,12 +937,8 @@ namespace {
 
         // 2. Produce Q, K, and V together. Splitting the combined projection
         // gives each attention head its query, key, and value channels.
-        const auto qkv_weight = config.read_qkv_projection_weight(
-            checkpoint_path, layer_index
-        );
-        const auto qkv_bias = config.read_qkv_projection_bias(
-            checkpoint_path, layer_index
-        );
+        const auto qkv_weight = config.read_qkv_projection_weight(layer_index);
+        const auto qkv_bias = config.read_qkv_projection_bias(layer_index);
         const auto combined_qkv = linear(
             normalized_for_attention, qkv_weight, qkv_bias
         );
@@ -972,10 +951,10 @@ namespace {
         // 4. The attention projection mixes information across heads. The
         // first residual addition preserves the block input alongside it.
         const auto attention_weight = config.read_attention_projection_weight(
-            checkpoint_path, layer_index
+            layer_index
         );
         const auto attention_bias = config.read_attention_projection_bias(
-            checkpoint_path, layer_index
+            layer_index
         );
         const auto projected_attention = linear(
             attention.output, attention_weight, attention_bias
@@ -985,10 +964,10 @@ namespace {
         // 5. A second pre-normalization prepares the residual stream for the
         // block's feed-forward MLP without modifying the residual bypass.
         const auto second_norm_weight = config.read_second_layer_norm_weight(
-            checkpoint_path, layer_index
+            layer_index
         );
         const auto second_norm_bias = config.read_second_layer_norm_bias(
-            checkpoint_path, layer_index
+            layer_index
         );
         const auto normalized_for_mlp = layer_norm(
             post_attention, second_norm_weight, second_norm_bias
@@ -997,20 +976,18 @@ namespace {
         // 6. Expand 768 channels to 3072, apply GPT-2's approximate GELU
         // activation, then project the result back down to 768 channels.
         const auto expansion_weight = config.read_mlp_expansion_weight(
-            checkpoint_path, layer_index
+            layer_index
         );
-        const auto expansion_bias = config.read_mlp_expansion_bias(
-            checkpoint_path, layer_index
-        );
+        const auto expansion_bias = config.read_mlp_expansion_bias(layer_index);
         const auto expanded = linear(
             normalized_for_mlp, expansion_weight, expansion_bias
         );
         const auto activated = expanded.gelu();
         const auto projection_weight = config.read_mlp_projection_weight(
-            checkpoint_path, layer_index
+            layer_index
         );
         const auto projection_bias = config.read_mlp_projection_bias(
-            checkpoint_path, layer_index
+            layer_index
         );
         const auto projected_mlp = linear(
             activated, projection_weight, projection_bias
@@ -1063,17 +1040,15 @@ namespace {
     }
 
     ActivationMatrix make_input_activations(
-        const sung::Path& checkpoint_path,
-        const Gpt2Config& config,
-        const std::vector<uint64_t>& token_ids
+        const Gpt2Config& config, const std::vector<uint64_t>& token_ids
     ) {
         ActivationMatrix output(token_ids.size(), config.channel_count());
         for (size_t position = 0; position < token_ids.size(); ++position) {
             const auto token_embedding = config.read_token_embedding(
-                checkpoint_path, token_ids[position]
+                token_ids[position]
             );
             const auto position_embedding = config.read_position_embedding(
-                checkpoint_path, position
+                position
             );
             for (size_t channel = 0; channel < config.channel_count();
                  ++channel) {
@@ -1258,23 +1233,17 @@ namespace {
     }
 
     size_t run_forward_pass(
-        const sung::Path& checkpoint_path,
-        const Gpt2Config& config,
-        const std::vector<uint64_t>& token_ids
+        const Gpt2Config& config, const std::vector<uint64_t>& token_ids
     ) {
         // 1. Add token and position embeddings for every context position,
         // producing a contiguous [token_count, channel_count] residual stream.
-        auto hidden_states = make_input_activations(
-            checkpoint_path, config, token_ids
-        );
+        auto hidden_states = make_input_activations(config, token_ids);
         print_activation_preview("Initial hidden states", hidden_states);
 
         // 2. Pass the entire context through every Transformer block. Each
         // block loads its weights once and applies them to every token row.
         for (size_t layer = 0; layer < config.layer_count(); ++layer) {
-            const auto block = transformer_block(
-                checkpoint_path, config, hidden_states, layer
-            );
+            const auto block = transformer_block(config, hidden_states, layer);
 
             // One detailed row makes the causal rule visible without dumping
             // every head and every query position from all twelve layers.
@@ -1314,12 +1283,8 @@ namespace {
 
         // 3. Apply GPT-2's final LayerNorm after the last Transformer block.
         // Every position is normalized, preserving a complete forward result.
-        const auto final_norm_weight = config.read_final_layer_norm_weight(
-            checkpoint_path
-        );
-        const auto final_norm_bias = config.read_final_layer_norm_bias(
-            checkpoint_path
-        );
+        const auto final_norm_weight = config.read_final_layer_norm_weight();
+        const auto final_norm_bias = config.read_final_layer_norm_bias();
         const auto final_hidden_states = layer_norm(
             hidden_states, final_norm_weight, final_norm_bias
         );
@@ -1332,9 +1297,7 @@ namespace {
         const auto final_hidden_state = activation_row(
             final_hidden_states, final_hidden_states.row_count - 1
         );
-        const auto token_embedding_table = config.read_token_embedding_table(
-            checkpoint_path
-        );
+        const auto token_embedding_table = config.read_token_embedding_table();
         auto logits = linear_without_bias(
             final_hidden_state,
             token_embedding_table,
@@ -1355,8 +1318,7 @@ namespace {
     void inspect_checkpoint(const ProgramOptions& options) {
         // 1. Read the fixed-size header, validate the GPT-2 format, and use
         // its model dimensions to reconstruct every parameter's file offset.
-        const auto header = read_header(options.checkpoint_path);
-        const auto config = Gpt2Config::create(header);
+        const auto config = Gpt2Config::create(options.checkpoint_path);
 
         // 2. Verify that the reconstructed parameter layout accounts for the
         // entire file, catching truncated or incompatible checkpoints.
@@ -1421,9 +1383,7 @@ namespace {
         std::cout << '\n';
 
         if (options.generation_count == 0) {
-            const size_t next_token_id = run_forward_pass(
-                options.checkpoint_path, config, token_ids
-            );
+            const size_t next_token_id = run_forward_pass(config, token_ids);
             if (tokenizer.has_value()) {
                 const std::array<uint64_t, 1> next_token{ next_token_id };
                 std::cout << "next_token_text: "
@@ -1447,9 +1407,7 @@ namespace {
             }
             std::cout << '\n';
 
-            const size_t next_token_id = run_forward_pass(
-                options.checkpoint_path, config, token_ids
-            );
+            const size_t next_token_id = run_forward_pass(config, token_ids);
             token_ids.push_back(next_token_id);
             generated_token_ids.push_back(next_token_id);
         }
